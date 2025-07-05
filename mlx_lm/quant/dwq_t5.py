@@ -14,6 +14,8 @@ import numpy as np
 from mlx.utils import tree_map
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from datasets import load_dataset as hf_load_dataset
+import random
 
 from mlx_lm.tuner.datasets import load_dataset
 from mlx_lm.tuner.trainer import iterate_batches
@@ -216,6 +218,114 @@ def load_t5_data(tokenizer, data_path: str, num_samples: int, max_seq_length: in
     return [process(i) for i in perm]
 
 
+def get_msmarco_calibration_data(num_samples=2048):
+    """Get diverse samples from MS MARCO for DWQ calibration"""
+    # Load MS MARCO passages
+    dataset = hf_load_dataset("ms_marco", "v2.1", split="train", streaming=True)
+    
+    samples = []
+    seen_lengths = set()
+    
+    for item in dataset:
+        # Get passage text
+        text = item['passages']['passage_text'][0]
+        
+        # Diversify by length
+        length_bucket = len(text) // 100
+        if length_bucket not in seen_lengths or len(samples) < num_samples:
+            samples.append(text)
+            seen_lengths.add(length_bucket)
+            
+        if len(samples) >= num_samples:
+            break
+    
+    return samples
+
+
+def get_diverse_calibration_mix(num_samples=2048):
+    """Mix different text types for better calibration"""
+    samples = []
+    
+    # 1. Questions (25%)
+    try:
+        nq = hf_load_dataset("natural_questions", split="train", streaming=True)
+        for i, item in enumerate(nq):
+            if i >= num_samples // 4:
+                break
+            samples.append(item['question']['text'])
+    except Exception as e:
+        print(f"Warning: Could not load Natural Questions: {e}")
+    
+    # 2. Passages (25%)
+    try:
+        marco = hf_load_dataset("ms_marco", "v2.1", split="train", streaming=True)
+        for i, item in enumerate(marco):
+            if i >= num_samples // 4:
+                break
+            samples.append(item['passages']['passage_text'][0][:512])
+    except Exception as e:
+        print(f"Warning: Could not load MS MARCO: {e}")
+    
+    # 3. Sentences (25%)
+    try:
+        stsb = hf_load_dataset("mteb/stsbenchmark-sts", split="train")
+        for i in range(min(len(stsb), num_samples // 4)):
+            samples.append(stsb[i]['sentence1'])
+    except Exception as e:
+        print(f"Warning: Could not load STS-B: {e}")
+    
+    # 4. Definitions/Descriptions (25%)
+    try:
+        wiki = hf_load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
+        for i, item in enumerate(wiki):
+            if i >= num_samples // 4:
+                break
+            # Get first sentence as definition
+            text = item['text'].split('.')[0] + '.'
+            if 20 < len(text) < 200:  # Good definition length
+                samples.append(text)
+    except Exception as e:
+        print(f"Warning: Could not load Wikipedia: {e}")
+    
+    random.shuffle(samples)
+    return samples[:num_samples]
+
+
+def load_calibration_data_from_standard_datasets(
+    tokenizer, 
+    num_samples: int = 2048,
+    max_seq_length: int = 512,
+    dataset_name: str = "mixed"
+):
+    """Load calibration data from standard datasets"""
+    
+    if dataset_name == "msmarco":
+        texts = get_msmarco_calibration_data(num_samples)
+    elif dataset_name == "stsb":
+        dataset = hf_load_dataset("mteb/stsbenchmark-sts", split="train")
+        texts = [item['sentence1'] for item in dataset[:num_samples]]
+    elif dataset_name == "nq":
+        dataset = hf_load_dataset("natural_questions", split="train", streaming=True)
+        texts = []
+        for i, item in enumerate(dataset):
+            if i >= num_samples:
+                break
+            texts.append(item['question']['text'])
+    elif dataset_name == "mixed":
+        texts = get_diverse_calibration_mix(num_samples)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    # Tokenize
+    data = []
+    for text in texts:
+        tokens = tokenizer.encode(text, max_length=max_seq_length, truncation=True)
+        if len(tokens) > 10:  # Skip very short sequences
+            data.append((tokens, len(tokens)))
+    
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", "-m", default="google/t5-small")
@@ -260,6 +370,13 @@ def main():
         default=1.0,
         help="Weight for activation loss component.",
     )
+    parser.add_argument(
+        "--calibration-dataset",
+        type=str,
+        default="mixed",
+        choices=["msmarco", "stsb", "nq", "mixed", "custom"],
+        help="Standard dataset to use for calibration (default: mixed)"
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -274,9 +391,18 @@ def main():
     # Load T5 encoder model using custom loading
     model, tokenizer = load_t5_encoder(args.model)
     
-    calibration_data = load_t5_data(
-        tokenizer, args.data_path, args.num_samples, args.max_seq_length
-    )
+    # Load calibration data
+    if args.calibration_dataset == "custom":
+        calibration_data = load_t5_data(
+            tokenizer, args.data_path, args.num_samples, args.max_seq_length
+        )
+    else:
+        calibration_data = load_calibration_data_from_standard_datasets(
+            tokenizer, 
+            args.num_samples, 
+            args.max_seq_length,
+            args.calibration_dataset
+        )
 
     if args.quantized_model is not None:
         q_model, _ = load_t5_encoder(args.quantized_model)
