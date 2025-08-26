@@ -297,23 +297,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            # Set appropriate headers based on streaming requirement
-            if self.stream:
-                self._set_stream_headers(400)
-                self.wfile.write(
-                    f"data: {json.dumps({'error': f'Invalid JSON in request body: {e}'})}\n\n".encode()
-                )
-            else:
-                self._set_completion_headers(400)
-                self.wfile.write(
-                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-                )
-            return
-
+        self.body = json.loads(raw_body.decode())
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
@@ -483,12 +467,100 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_calls = tool_calls or []
 
         def parse_function(tool_text):
-            tool_call = json.loads(tool_text.strip())
+            """
+            Parse a tool call emitted by the model into the OpenAI-compatible
+            tool_call structure.
+
+            Supports two formats:
+            1) JSON: '{"name": "fn", "arguments": { ... }}'
+            2) XML-like blocks:
+               '<tool_call>fn\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>...'</n>
+
+            Returns:
+                dict with keys: type, id, function:{name, arguments(JSON string)}
+            """
+            import re
+
+            s = (tool_text or "").strip()
+
+            # Helper: coerce arguments for known tools (e.g., shell)
+            def _coerce_known_args(name: Optional[str], args_val: Any) -> str:
+                try:
+                    # Normalize to dict for mutation
+                    if isinstance(args_val, str):
+                        # If function is shell-like and args is a plain string, wrap as bash -lc
+                        if name in ("shell", "container.exec"):
+                            coerced = {"command": ["bash", "-lc", args_val]}
+                            return json.dumps(coerced)
+                        # Otherwise, leave as-is
+                        return args_val
+                    elif isinstance(args_val, dict):
+                        # If shell-like and command is a string, wrap into array
+                        if name in ("shell", "container.exec"):
+                            cmd = args_val.get("command")
+                            if isinstance(cmd, str):
+                                args_val["command"] = ["bash", "-lc", cmd]
+                        return json.dumps(args_val)
+                    else:
+                        # For arrays or other JSON types, just dump
+                        return json.dumps(args_val)
+                except Exception:
+                    # Fallback: best effort string
+                    return json.dumps(args_val) if not isinstance(args_val, str) else args_val
+
+            # Try JSON first
+            try:
+                tool_call = json.loads(s)
+                name = tool_call.get("name")
+                args_obj = tool_call.get("arguments", {})
+                # Coerce/normalize arguments for known tools
+                args_json = _coerce_known_args(name, args_obj)
+                return {
+                    "function": {"name": name, "arguments": args_json},
+                    "type": "function",
+                    "id": None,
+                }
+            except Exception:
+                pass
+
+            # Parse XML-like <tool_call> format
+            # function name is text before first <arg_key>
+            # Pairs are <arg_key>KEY</arg_key> <arg_value>VAL</arg_value>
+            # Note: values may be JSON (emitted via tojson) or bare strings
+            # Build argument dict preserving JSON types when possible
+            # Extract function name
+            idx = s.find("<arg_key>")
+            if idx == -1:
+                name = s.strip()
+                rest = ""
+            else:
+                name = s[:idx].strip()
+                rest = s[idx:]
+
+            # Extract key/value pairs
+            pairs = re.findall(
+                r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+                rest,
+                flags=re.S,
+            )
+
+            def _parse_value(v: str):
+                v = v.strip()
+                # Try to json-decode first (handles objects, arrays, numbers, true/false/null, quoted strings)
+                try:
+                    return json.loads(v)
+                except Exception:
+                    return v
+
+            args_dict: Dict[str, Any] = {}
+            for k, v in pairs:
+                key = k.strip()
+                val = _parse_value(v)
+                args_dict[key] = val
+
+            args_json = _coerce_known_args(name, args_dict)
             return {
-                "function": {
-                    "name": tool_call.get("name", None),
-                    "arguments": json.dumps(tool_call.get("arguments", "")),
-                },
+                "function": {"name": name or None, "arguments": args_json},
                 "type": "function",
                 "id": None,
             }
@@ -503,17 +575,15 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
+                    "logprobs": {
+                        "token_logprobs": token_logprobs,
+                        "top_logprobs": top_logprobs,
+                        "tokens": tokens,
+                    },
                     "finish_reason": finish_reason,
                 },
             ],
         }
-
-        if token_logprobs or top_logprobs or tokens:
-            response["choices"][0]["logprobs"] = {
-                "token_logprobs": token_logprobs,
-                "top_logprobs": top_logprobs,
-                "tokens": tokens,
-            }
 
         if not self.stream:
             if not (
@@ -535,15 +605,22 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
+            parsed_calls = [parse_function(tool_text) for tool_text in tool_calls]
+            # Ensure each tool_call has an id and (for streaming) an index
+            for i, c in enumerate(parsed_calls):
+                if not c.get("id"):
+                    c["id"] = f"call_{uuid.uuid4()}"
+                if self.stream:
+                    c["index"] = i
             choice[key_name] = {
                 "role": "assistant",
                 "content": text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+                "tool_calls": parsed_calls,
             }
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
-            raise ValueError(f"Unsupported response type: {self.object_type}")
+            ValueError(f"Unsupported response type: {self.object_type}")
 
         return response
 
@@ -680,23 +757,36 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         in_tool_call = False
         segment = ""
+        # Buffer to detect inline <tool_call>...</tool_call> when tokenizer lacks special tokens
+        inline_tool_buf = ""
+        tool_call_seen = False
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
-
+        def extract_inline_tool_calls(buf: str):
+            """
+            Extract complete <tool_call>...</tool_call> blocks from the buffer.
+            Returns (clean_text, extracted_tool_texts, remainder_buffer)
+            where clean_text is the text with tool blocks removed.
+            """
+            extracted = []
+            out = []
+            i = 0
+            while True:
+                start = buf.find("<tool_call>", i)
+                if start == -1:
+                    out.append(buf[i:])
+                    break
+                # add text up to start
+                out.append(buf[i:start])
+                end = buf.find("</tool_call>", start)
+                if end == -1:
+                    # Incomplete block; keep from start in remainder
+                    remainder = buf[start:]
+                    return ("".join(out), extracted, remainder)
+                # Extract inside content between tags
+                inside = buf[start + len("<tool_call>") : end]
+                extracted.append(inside)
+                i = end + len("</tool_call>")
+            return ("".join(out), extracted, "")
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -707,25 +797,39 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
-            prompt_progress_callback=keepalive_callback,
         ):
             logging.debug(gen_response.text)
 
             if (
-                self.tokenizer.has_tool_calling
-                and gen_response.text == self.tokenizer.tool_call_start
+                getattr(self.tokenizer, "has_tool_calling", False)
+                and gen_response.text == getattr(self.tokenizer, "tool_call_start", None)
             ):
                 in_tool_call = True
             elif in_tool_call:
-                if gen_response.text == self.tokenizer.tool_call_end:
+                if gen_response.text == getattr(self.tokenizer, "tool_call_end", None):
                     tool_calls.append(tool_text)
+                    tool_call_seen = True
                     tool_text = ""
                     in_tool_call = False
                 else:
                     tool_text += gen_response.text
             else:
-                text += gen_response.text
-                segment += gen_response.text
+                # Accumulate and post-process inline XML-style tool calls
+                inline_tool_buf += gen_response.text
+                clean, extracted, remainder = extract_inline_tool_calls(inline_tool_buf)
+                if clean:
+                    text += clean
+                    segment += clean
+                if extracted:
+                    tool_calls.extend(extracted)
+                    tool_call_seen = True
+                    try:
+                        logging.debug(
+                            f"Extracted inline tool_call blocks: {len(extracted)}"
+                        )
+                    except Exception:
+                        pass
+                inline_tool_buf = remainder
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
@@ -766,6 +870,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     response = self.generate_response(
                         segment, None, tool_calls=tool_calls
                     )
+                    try:
+                        logging.debug(
+                            f"Streaming chunk: content_len={len(segment)}, tool_calls={len(tool_calls)}"
+                        )
+                    except Exception:
+                        pass
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
                     segment = ""
@@ -781,18 +891,22 @@ class APIHandler(BaseHTTPRequestHandler):
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
 
         if self.stream:
+            # If any tool call was seen this turn, set finish_reason accordingly
+            if tool_call_seen:
+                finish_reason = "tool_calls"
             response = self.generate_response(
                 segment, finish_reason, tool_calls=tool_calls
             )
+            try:
+                logging.debug(
+                    f"Final stream chunk: content_len={len(segment)}, tool_calls={len(tool_calls)}"
+                )
+            except Exception:
+                pass
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                original_prompt_length = (
-                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
-                )
-                response = self.completion_usage_response(
-                    original_prompt_length, len(tokens)
-                )
+                response = self.completion_usage_response(len(prompt), len(tokens))
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -854,6 +968,25 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.tokenizer.chat_template:
             messages = body["messages"]
             process_message_content(messages)
+
+            # Normalize tool call arguments for templates that expect dicts
+            def _normalize_tool_calls_for_template(msgs: List[dict]):
+                for m in msgs:
+                    tcs = m.get("tool_calls")
+                    if not isinstance(tcs, list):
+                        continue
+                    for tc in tcs:
+                        fn = tc.get("function") if isinstance(tc, dict) else None
+                        if isinstance(fn, dict):
+                            args = fn.get("arguments")
+                            if isinstance(args, str):
+                                try:
+                                    fn["arguments"] = json.loads(args)
+                                except Exception:
+                                    # leave as string if not valid JSON
+                                    pass
+
+            _normalize_tool_calls_for_template(messages)
             prompt = self.tokenizer.apply_chat_template(
                 messages,
                 body.get("tools") or None,
@@ -1091,3 +1224,4 @@ if __name__ == "__main__":
         " Use `mlx_lm.server...` or `python -m mlx_lm server ...` instead."
     )
     main()
+
