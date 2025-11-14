@@ -31,6 +31,7 @@ class QuantizedSwitchLinear(nn.Module):
         bias: bool = True,
         group_size: int = 64,
         bits: int = 4,
+        mode: str = "affine",
     ):
         super().__init__()
 
@@ -43,6 +44,7 @@ class QuantizedSwitchLinear(nn.Module):
             ),
             group_size=group_size,
             bits=bits,
+            mode=mode,
         )
 
         if bias:
@@ -50,6 +52,7 @@ class QuantizedSwitchLinear(nn.Module):
 
         self.group_size = group_size
         self.bits = bits
+        self.mode = mode
 
         # Freeze this model's parameters
         self.freeze()
@@ -121,12 +124,14 @@ class SwitchLinear(nn.Module):
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4):
+    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
         num_experts, output_dims, input_dims = self.weight.shape
         ql = QuantizedSwitchLinear(
-            input_dims, output_dims, num_experts, False, group_size, bits
+            input_dims, output_dims, num_experts, False, group_size, bits, mode
         )
-        ql.weight, ql.scales, ql.biases = mx.quantize(self.weight, group_size, bits)
+        ql.weight, ql.scales, ql.biases = mx.quantize(
+            self.weight, group_size, bits, mode=mode
+        )
         if "bias" in self:
             ql.bias = self.bias
         return ql

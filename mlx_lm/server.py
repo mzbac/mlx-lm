@@ -133,16 +133,25 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content")
+        if content is None:
+            # Tool messages (and some assistant responses) omit content entirely.
+            message["content"] = ""
+            continue
         if isinstance(content, list):
             text_fragments = [
-                fragment["text"] for fragment in content if fragment["type"] == "text"
+                fragment.get("text", "")
+                for fragment in content
+                if fragment.get("type") == "text"
             ]
-            if len(text_fragments) != len(content):
-                raise ValueError("Only 'text' content type is supported.")
-            message["content"] = "".join(text_fragments)
-        elif content is None:
-            message["content"] = ""
+            if not text_fragments and any(
+                fragment.get("type") != "text" for fragment in content
+            ):
+                # Ignore non-text fragments instead of raising; Codex sends tool blocks
+                # that should pass through untouched.
+                message["content"] = ""
+            else:
+                message["content"] = "".join(text_fragments)
 
 
 @dataclass
@@ -1224,4 +1233,3 @@ if __name__ == "__main__":
         " Use `mlx_lm.server...` or `python -m mlx_lm server ...` instead."
     )
     main()
-
