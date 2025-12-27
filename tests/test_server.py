@@ -473,5 +473,421 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [])
 
 
+class TestAnthropicAPI(unittest.TestCase):
+    """Test Anthropic /v1/messages API compatibility."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def test_basic_message(self):
+        """Test basic message completion."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("id", body)
+        self.assertTrue(body["id"].startswith("msg_"))
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+        self.assertIn("content", body)
+        self.assertIn("stop_reason", body)
+        self.assertIn("usage", body)
+
+    def test_system_prompt_string(self):
+        """Test system prompt as string."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_system_prompt_blocks(self):
+        """Test system prompt as content blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "system": [{"type": "text", "text": "You are helpful."}],
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_content_blocks(self):
+        """Test message with content blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_streaming(self):
+        """Test streaming response format."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        events = []
+        for line in response.iter_lines():
+            if line:
+                line = line.decode("utf-8")
+                if line.startswith("event:"):
+                    events.append(line.split(": ", 1)[1])
+
+        # Verify expected event sequence
+        self.assertIn("message_start", events)
+        self.assertIn("content_block_start", events)
+        self.assertIn("message_stop", events)
+
+    def test_stop_sequences(self):
+        """Test stop_sequences parameter."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 50,
+            "stop_sequences": ["\n"],
+            "messages": [{"role": "user", "content": "Count: 1, 2, 3"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_temperature(self):
+        """Test temperature parameter."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "temperature": 0.5,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_top_p_top_k(self):
+        """Test top_p and top_k parameters."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "top_p": 0.9,
+            "top_k": 40,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_usage_tokens(self):
+        """Test usage token counts in response."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        body = response.json()
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIn("output_tokens", body["usage"])
+        self.assertGreater(body["usage"]["input_tokens"], 0)
+        self.assertGreater(body["usage"]["output_tokens"], 0)
+
+    def test_tool_result_in_messages(self):
+        """Test handling of tool_result content blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "calculator",
+                            "input": {"expr": "2+2"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_123", "content": "4"}
+                    ],
+                },
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_tool_result_with_is_error(self):
+        """Test tool_result with is_error flag."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "Run command"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_456",
+                            "name": "execute",
+                            "input": {"cmd": "invalid"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_456",
+                            "content": "Command failed: not found",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_tool_result_with_nested_content(self):
+        """Test tool_result with nested content blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "Get info"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_789",
+                            "name": "get_info",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_789",
+                            "content": [
+                                {"type": "text", "text": "Info line 1"},
+                                {"type": "text", "text": "Info line 2"},
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_multi_turn_conversation(self):
+        """Test multi-turn conversation with alternating roles."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "How are you?"},
+                {"role": "assistant", "content": "I'm fine."},
+                {"role": "user", "content": "Great!"},
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["role"], "assistant")
+
+    def test_mixed_content_blocks(self):
+        """Test message with multiple text blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "First part. "},
+                        {"type": "text", "text": "Second part."},
+                    ],
+                }
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_tool_definitions(self):
+        """Test request with tool definitions."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather for a location",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string", "description": "City name"},
+                        },
+                        "required": ["location"],
+                    },
+                }
+            ],
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_streaming_data_format(self):
+        """Test streaming response data structure."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        message_start_data = None
+        message_delta_data = None
+        for line in response.iter_lines():
+            if line:
+                line = line.decode("utf-8")
+                if line.startswith("data:"):
+                    data = json.loads(line[5:].strip())
+                    if data.get("type") == "message_start":
+                        message_start_data = data
+                    elif data.get("type") == "message_delta":
+                        message_delta_data = data
+
+        # Verify message_start structure
+        self.assertIsNotNone(message_start_data)
+        self.assertIn("message", message_start_data)
+        self.assertEqual(message_start_data["message"]["role"], "assistant")
+        self.assertIn("usage", message_start_data["message"])
+
+        # Verify message_delta structure
+        self.assertIsNotNone(message_delta_data)
+        self.assertIn("delta", message_delta_data)
+        self.assertIn("stop_reason", message_delta_data["delta"])
+        self.assertIn("usage", message_delta_data)
+
+    def test_empty_system_prompt(self):
+        """Test with empty system prompt."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "system": "",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+    def test_response_content_structure(self):
+        """Test that response content is an array of content blocks."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        body = response.json()
+
+        # Content should be a list
+        self.assertIsInstance(body["content"], list)
+        # Each content block should have a type
+        for block in body["content"]:
+            self.assertIn("type", block)
+            if block["type"] == "text":
+                self.assertIn("text", block)
+
+    def test_model_in_response(self):
+        """Test that model is included in response."""
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        body = response.json()
+        self.assertIn("model", body)
+        self.assertEqual(body["model"], "default_model")
+
+    def test_query_parameters_ignored(self):
+        """Test that query parameters in URL don't cause 404."""
+        # Claude clients may send query params like ?beta=true
+        url = f"http://localhost:{self.port}/v1/messages?beta=true"
+        post_data = {
+            "model": "default_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Condition, Lock, Thread
@@ -164,6 +165,83 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
+
+
+def convert_anthropic_messages(body: dict) -> List[dict]:
+    """Convert Anthropic API messages format to internal chat format.
+
+    Handles:
+    - system field (string or list of content blocks)
+    - message content blocks (text, tool_use, tool_result)
+    """
+    messages = []
+
+    # Handle system prompt
+    system = body.get("system")
+    if system:
+        if isinstance(system, str):
+            messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            # List of content blocks
+            text = "".join(
+                b.get("text", "") for b in system if b.get("type") == "text"
+            )
+            if text:
+                messages.append({"role": "system", "content": text})
+
+    # Convert messages
+    for msg in body.get("messages", []):
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            # Handle content blocks
+            text_parts = []
+            for block in content:
+                block_type = block.get("type")
+                if block_type == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block_type == "tool_use":
+                    # Include tool use as text for context
+                    name = block.get("name", "")
+                    input_data = block.get("input", {})
+                    text_parts.append(f"[Tool call: {name}({json.dumps(input_data)})]")
+                elif block_type == "tool_result":
+                    # Flatten tool result for the model
+                    tool_id = block.get("tool_use_id", "")
+                    result = block.get("content", "")
+                    if isinstance(result, list):
+                        result = "".join(
+                            b.get("text", "") for b in result if b.get("type") == "text"
+                        )
+                    text_parts.append(f"[Tool result ({tool_id}): {result}]")
+            messages.append({"role": role, "content": "".join(text_parts)})
+        else:
+            messages.append({"role": role, "content": ""})
+
+    return messages
+
+
+def convert_anthropic_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]:
+    """Convert Anthropic tool format to internal format.
+
+    Anthropic uses 'input_schema' while OpenAI uses 'parameters'.
+    """
+    if not tools:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {}),
+            },
+        }
+        for tool in tools
+    ]
 
 
 class LRUPromptCache:
@@ -868,6 +946,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.created = int(time.time())
         self.response_generator = response_generator
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
+        self.is_anthropic = False  # Set per-request in handle_anthropic_messages()
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
@@ -898,9 +977,13 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/messages": self.handle_anthropic_messages,
         }
 
-        if self.path not in request_factories:
+        # Parse path to remove query string (e.g., /v1/messages?beta=true -> /v1/messages)
+        parsed_path = urlparse(self.path).path
+
+        if parsed_path not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -954,13 +1037,16 @@ class APIHandler(BaseHTTPRequestHandler):
         self.seed = self.body.get("seed", None)
         self.validate_model_parameters()
 
-        # Get stop sequences
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
-        stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
+        # Get stop sequences (Anthropic uses stop_sequences, OpenAI uses stop)
+        if parsed_path == "/v1/messages":
+            stop_words = self.body.get("stop_sequences", [])
+        else:
+            stop_words = self.body.get("stop")
+            stop_words = stop_words or []
+            stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        request = request_factories[parsed_path]()
         self.handle_completion(request, stop_words)
 
     def validate_model_parameters(self):
@@ -1132,6 +1218,173 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def generate_anthropic_response(
+        self,
+        text: str,
+        finish_reason: Optional[str],
+        prompt_token_count: Optional[int] = None,
+        completion_token_count: Optional[int] = None,
+        tool_calls: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        Generate an Anthropic-format response.
+
+        Args:
+            text (str): Text generated by model
+            finish_reason (Optional[str]): The reason generation stopped
+            prompt_token_count (Optional[int]): Number of input tokens
+            completion_token_count (Optional[int]): Number of output tokens
+            tool_calls (Optional[List[str]]): List of tool call JSON strings
+
+        Returns:
+            dict: Anthropic API format response
+        """
+        content = []
+
+        # Add text content if present
+        if text:
+            content.append({"type": "text", "text": text})
+
+        # Add tool use blocks
+        for tool_text in (tool_calls or []):
+            try:
+                tool_data = json.loads(tool_text.strip())
+                content.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": tool_data.get("name", ""),
+                    "input": tool_data.get("arguments", {}),
+                })
+            except json.JSONDecodeError:
+                pass
+
+        # Map finish reason to Anthropic format
+        stop_reason_map = {
+            "stop": "end_turn",
+            "length": "max_tokens",
+            "tool_calls": "tool_use",
+        }
+        stop_reason = stop_reason_map.get(finish_reason, finish_reason)
+
+        response = {
+            "id": self.request_id,
+            "type": "message",
+            "role": "assistant",
+            "model": self.requested_model,
+            "content": content,
+            "stop_reason": stop_reason,
+        }
+
+        if prompt_token_count is not None and completion_token_count is not None:
+            response["usage"] = {
+                "input_tokens": prompt_token_count,
+                "output_tokens": completion_token_count,
+            }
+
+        return response
+
+    def _send_anthropic_stream_events(
+        self,
+        text: str,
+        finish_reason: Optional[str],
+        tool_calls: Optional[List[str]],
+        input_tokens: int,
+        output_tokens: int,
+    ):
+        """
+        Send Anthropic-format SSE streaming events.
+
+        Event sequence: message_start -> content_block_start -> content_block_delta
+                       -> content_block_stop -> message_delta -> message_stop
+        """
+        # message_start
+        message_start = {
+            "type": "message_start",
+            "message": {
+                "id": self.request_id,
+                "type": "message",
+                "role": "assistant",
+                "model": self.requested_model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        }
+        self.wfile.write(f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode())
+
+        # content_block_start (text)
+        block_start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+        self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+
+        # content_block_delta
+        if text:
+            delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }
+            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+
+        # content_block_stop
+        block_stop = {"type": "content_block_stop", "index": 0}
+        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+
+        # Handle tool calls if present
+        block_index = 1
+        for tool_text in (tool_calls or []):
+            try:
+                tool_data = json.loads(tool_text.strip())
+                # tool_use content_block_start
+                tool_block = {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                        "name": tool_data.get("name", ""),
+                        "input": {},
+                    },
+                }
+                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_block)}\n\n".encode())
+
+                # input_json_delta
+                input_delta = {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(tool_data.get("arguments", {})),
+                    },
+                }
+                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n".encode())
+
+                # content_block_stop
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode())
+                block_index += 1
+            except json.JSONDecodeError:
+                pass
+
+        # message_delta with stop_reason and usage
+        stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
+            finish_reason, finish_reason
+        )
+        message_delta = {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        }
+        self.wfile.write(f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n".encode())
+
+        # message_stop
+        self.wfile.write(f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode())
+
+        self.wfile.flush()
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1272,40 +1525,61 @@ class APIHandler(BaseHTTPRequestHandler):
                 ):
                     continue
                 elif segment or tool_calls:
-                    response = self.generate_response(
-                        segment, None, tool_calls=tool_calls
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
-                    segment = ""
-                    tool_calls = []
+                    # For Anthropic, we send everything at the end via _send_anthropic_stream_events
+                    # For OpenAI, we send incremental chunks
+                    if not self.is_anthropic:
+                        response = self.generate_response(
+                            segment, None, tool_calls=tool_calls
+                        )
+                        self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                        self.wfile.flush()
+                        segment = ""
+                        tool_calls = []
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
         if self.stream:
-            response = self.generate_response(
-                segment, finish_reason, tool_calls=tool_calls
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
-            if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+            if self.is_anthropic:
+                # Send Anthropic-format streaming response
+                self._send_anthropic_stream_events(
+                    text, finish_reason, tool_calls, len(ctx.prompt), len(tokens)
+                )
+            else:
+                # Send OpenAI-format streaming response
+                response = self.generate_response(
+                    segment, finish_reason, tool_calls=tool_calls
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
-            self.wfile.write("data: [DONE]\n\n".encode())
-            self.wfile.flush()
+                if self.stream_options is not None and self.stream_options["include_usage"]:
+                    response = self.completion_usage_response(len(ctx.prompt), len(tokens))
+                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
         else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(ctx.prompt),
-                len(tokens),
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                tool_calls=tool_calls,
-            )
+            if self.is_anthropic:
+                # Send Anthropic-format response
+                response = self.generate_anthropic_response(
+                    text,
+                    finish_reason,
+                    len(ctx.prompt),
+                    len(tokens),
+                    tool_calls=tool_calls,
+                )
+            else:
+                # Send OpenAI-format response
+                response = self.generate_response(
+                    text,
+                    finish_reason,
+                    len(ctx.prompt),
+                    len(tokens),
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    tool_calls=tool_calls,
+                )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
             logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
@@ -1374,6 +1648,35 @@ class APIHandler(BaseHTTPRequestHandler):
             self.body["prompt"],
             [],
             None,
+            None,
+        )
+
+    def handle_anthropic_messages(self) -> CompletionRequest:
+        """
+        Handle Anthropic /v1/messages endpoint.
+
+        Converts Anthropic API format to internal format for processing.
+
+        Returns:
+            CompletionRequest: The converted request ready for completion.
+        """
+        body = self.body
+        assert "messages" in body, "Request did not contain messages"
+
+        # Set Anthropic-specific identifiers
+        self.request_id = f"msg_{uuid.uuid4()}"
+        self.object_type = "anthropic.message"
+        self.is_anthropic = True
+
+        # Convert messages from Anthropic format
+        messages = convert_anthropic_messages(body)
+        tools = convert_anthropic_tools(body.get("tools"))
+
+        return CompletionRequest(
+            "chat",  # Use chat tokenization
+            "",
+            messages,
+            tools,
             None,
         )
 
