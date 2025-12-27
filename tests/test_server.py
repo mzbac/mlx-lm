@@ -10,7 +10,13 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    ResponseGenerator,
+    parse_minimax_tool_calls,
+    normalize_tool_calls,
+)
 from mlx_lm.utils import load
 
 
@@ -887,6 +893,118 @@ class TestAnthropicAPI(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["type"], "message")
         self.assertEqual(body["role"], "assistant")
+
+
+class TestMiniMaxToolParsing(unittest.TestCase):
+    """Test MiniMax XML tool call parsing."""
+
+    def test_parse_single_tool_call(self):
+        """Test parsing a single MiniMax-style tool call."""
+        tool_text = '''<invoke name="get_weather">
+<parameter name="location">San Francisco</parameter>
+<parameter name="unit">celsius</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "get_weather")
+        self.assertEqual(result[0]["arguments"]["location"], "San Francisco")
+        self.assertEqual(result[0]["arguments"]["unit"], "celsius")
+
+    def test_parse_multiple_tool_calls(self):
+        """Test parsing multiple tool calls in one block."""
+        tool_text = '''<invoke name="read_file">
+<parameter name="path">/tmp/test.txt</parameter>
+</invoke>
+<invoke name="write_file">
+<parameter name="path">/tmp/output.txt</parameter>
+<parameter name="content">Hello World</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["name"], "read_file")
+        self.assertEqual(result[0]["arguments"]["path"], "/tmp/test.txt")
+        self.assertEqual(result[1]["name"], "write_file")
+        self.assertEqual(result[1]["arguments"]["path"], "/tmp/output.txt")
+        self.assertEqual(result[1]["arguments"]["content"], "Hello World")
+
+    def test_parse_json_parameter_value(self):
+        """Test parsing parameter values that are valid JSON."""
+        tool_text = '''<invoke name="run_code">
+<parameter name="code">print("hello")</parameter>
+<parameter name="timeout">30</parameter>
+<parameter name="enabled">true</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        # JSON values should be parsed
+        self.assertEqual(result[0]["arguments"]["timeout"], 30)
+        self.assertEqual(result[0]["arguments"]["enabled"], True)
+        # Non-JSON string should remain as string
+        self.assertEqual(result[0]["arguments"]["code"], 'print("hello")')
+
+    def test_parse_empty_text(self):
+        """Test parsing empty text returns empty list."""
+        result = parse_minimax_tool_calls("")
+        self.assertEqual(result, [])
+
+    def test_parse_no_tools(self):
+        """Test parsing text without tool calls returns empty list."""
+        result = parse_minimax_tool_calls("Just some regular text")
+        self.assertEqual(result, [])
+
+    def test_normalize_tool_calls_with_minimax_format(self):
+        """Test normalize_tool_calls converts MiniMax format to JSON."""
+        tool_texts = ['''<invoke name="test_tool">
+<parameter name="arg1">value1</parameter>
+</invoke>''']
+        result = normalize_tool_calls(tool_texts)
+        self.assertEqual(len(result), 1)
+        parsed = json.loads(result[0])
+        self.assertEqual(parsed["name"], "test_tool")
+        self.assertEqual(parsed["arguments"]["arg1"], "value1")
+
+    def test_normalize_tool_calls_with_json_format(self):
+        """Test normalize_tool_calls preserves JSON format."""
+        tool_texts = ['{"name": "test_tool", "arguments": {"arg1": "value1"}}']
+        result = normalize_tool_calls(tool_texts)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], tool_texts[0])
+
+    def test_normalize_tool_calls_mixed_format(self):
+        """Test normalize_tool_calls handles mixed formats."""
+        tool_texts = [
+            '{"name": "json_tool", "arguments": {}}',
+            '''<invoke name="xml_tool">
+<parameter name="p1">v1</parameter>
+</invoke>''',
+        ]
+        result = normalize_tool_calls(tool_texts)
+        self.assertEqual(len(result), 2)
+        # First should be unchanged
+        parsed1 = json.loads(result[0])
+        self.assertEqual(parsed1["name"], "json_tool")
+        # Second should be converted
+        parsed2 = json.loads(result[1])
+        self.assertEqual(parsed2["name"], "xml_tool")
+
+    def test_parse_single_quotes(self):
+        """Test parsing with single quotes in attribute names."""
+        tool_text = '''<invoke name='get_data'>
+<parameter name='id'>123</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "get_data")
+        self.assertEqual(result[0]["arguments"]["id"], 123)
+
+    def test_parse_nested_json_value(self):
+        """Test parsing parameter with nested JSON object."""
+        tool_text = '''<invoke name="create_item">
+<parameter name="data">{"key": "value", "count": 5}</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["arguments"]["data"], {"key": "value", "count": 5})
 
 
 if __name__ == "__main__":

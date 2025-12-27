@@ -244,6 +244,81 @@ def convert_anthropic_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]
     ]
 
 
+def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
+    """Parse MiniMax-style XML tool calls into standard JSON format.
+
+    MiniMax format:
+        <invoke name="tool-name">
+        <parameter name="param1">value1</parameter>
+        <parameter name="param2">value2</parameter>
+        </invoke>
+
+    Returns list of dicts with {"name": "...", "arguments": {...}}
+    """
+    import re
+
+    tool_calls = []
+
+    # Find all <invoke> blocks
+    invoke_pattern = re.compile(
+        r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
+        re.DOTALL
+    )
+    param_pattern = re.compile(
+        r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>',
+        re.DOTALL
+    )
+
+    for match in invoke_pattern.finditer(tool_text):
+        tool_name = match.group(1)
+        invoke_body = match.group(2)
+
+        # Extract parameters
+        arguments = {}
+        for param_match in param_pattern.finditer(invoke_body):
+            param_name = param_match.group(1)
+            param_value = param_match.group(2).strip()
+
+            # Try to parse JSON values
+            try:
+                arguments[param_name] = json.loads(param_value)
+            except (json.JSONDecodeError, ValueError):
+                # Keep as string if not valid JSON
+                arguments[param_name] = param_value
+
+        tool_calls.append({
+            "name": tool_name,
+            "arguments": arguments,
+        })
+
+    return tool_calls
+
+
+def normalize_tool_calls(tool_texts: List[str]) -> List[str]:
+    """Normalize tool call text from various formats to standard JSON.
+
+    Handles:
+    - Standard JSON format: {"name": "...", "arguments": {...}}
+    - MiniMax XML format: <invoke name="...">...</invoke>
+    - Other formats as-is
+    """
+    normalized = []
+
+    for tool_text in tool_texts:
+        text = tool_text.strip()
+
+        # Check if it's MiniMax XML format
+        if "<invoke" in text and "</invoke>" in text:
+            parsed_calls = parse_minimax_tool_calls(text)
+            for call in parsed_calls:
+                normalized.append(json.dumps(call))
+        else:
+            # Assume it's already JSON or pass through
+            normalized.append(text)
+
+    return normalized
+
+
 class LRUPromptCache:
 
     @dataclass
@@ -1245,8 +1320,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if text:
             content.append({"type": "text", "text": text})
 
+        # Normalize tool calls (handles MiniMax XML format and others)
+        normalized_calls = normalize_tool_calls(tool_calls or [])
+
         # Add tool use blocks
-        for tool_text in (tool_calls or []):
+        for tool_text in normalized_calls:
             try:
                 tool_data = json.loads(tool_text.strip())
                 content.append({
@@ -1334,9 +1412,10 @@ class APIHandler(BaseHTTPRequestHandler):
         block_stop = {"type": "content_block_stop", "index": 0}
         self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
 
-        # Handle tool calls if present
+        # Handle tool calls if present (normalize for MiniMax XML format)
+        normalized_calls = normalize_tool_calls(tool_calls or [])
         block_index = 1
-        for tool_text in (tool_calls or []):
+        for tool_text in normalized_calls:
             try:
                 tool_data = json.loads(tool_text.strip())
                 # tool_use content_block_start
