@@ -1363,9 +1363,8 @@ class APIHandler(BaseHTTPRequestHandler):
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
 
-        # Only extract/clean for final response, not incremental streaming chunks
         if self.stream and finish_reason is None:
-            clean_text = text
+            clean_text = self._clean_thinking_content(text)
             all_tool_calls = tool_calls
         else:
             clean_text, extracted = self._extract_tool_calls_from_text(text)
@@ -1440,6 +1439,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _clean_thinking_content(self, text: str) -> str:
+        """Clean thinking content and other model artifacts from text during streaming."""
+        import re
+        if not text:
+            return text
+
+        clean = text
+        clean = re.sub(r'<think>.*?</think>', '', clean, flags=re.DOTALL)
+        clean = re.sub(r'<think>.*$', '', clean, flags=re.DOTALL)
+        clean = re.sub(r'^.*?</think>', '', clean, flags=re.DOTALL)
+        clean = re.sub(r'\[e~\[', '', clean)
+        clean = re.sub(r'⏺', '', clean)
+        clean = re.sub(r'\]~b\][a-z]+', '', clean)
+
+        return clean
+
     def _extract_tool_calls_from_text(self, text: str) -> Tuple[str, List[str]]:
         """Extract tool calls from text and return cleaned text with tool call list.
 
@@ -1496,11 +1511,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Clean up model artifacts from text
         if clean_text:
-            clean_text = re.sub(r'</?think>', '', clean_text)
-            clean_text = re.sub(r'\[e~\[', '', clean_text)
-            clean_text = re.sub(r'⏺', '', clean_text)
+            clean_text = self._clean_thinking_content(clean_text)
+            # Also clean minimax tool call tags (already extracted above)
             clean_text = re.sub(r'</?minimax:tool_call>', '', clean_text)
-            clean_text = re.sub(r'\]~b\][a-z]+', '', clean_text)
 
         return clean_text, extracted
 
@@ -1733,6 +1746,10 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_calls = []
         tool_text = ""
 
+        # Variables to track thinking content (suppress until </think>)
+        in_thinking = True  # Assume model starts with thinking (common pattern)
+        thinking_ended = False
+
         # Variables to save the generated tokens and the corresponding probs
         tokens = []
         token_logprobs = []
@@ -1763,6 +1780,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 text += gen.text
                 segment += gen.text
 
+                # Detect end of thinking content
+                if in_thinking and "</think>" in text:
+                    in_thinking = False
+                    thinking_ended = True
+                    # Clear segment - we don't want to send thinking content
+                    # Extract only the part after </think>
+                    if "</think>" in segment:
+                        segment = segment.split("</think>", 1)[-1]
+
+                # Detect start of thinking (if model uses <think> tag)
+                if not in_thinking and not thinking_ended and "<think>" in text:
+                    in_thinking = True
+
+                # Fallback: if no thinking tags seen after significant output, assume no thinking
+                # This prevents infinite suppression for models that don't use thinking
+                if in_thinking and not thinking_ended and len(text) > 200:
+                    if "<think>" not in text and "</think>" not in text:
+                        in_thinking = False
+
                 # Detect inline XML tool calls for models without special tokens
                 if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text):
                     in_xml_tool_call = True
@@ -1787,7 +1823,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 segment = ""
                 break
 
-            if self.stream and not in_tool_call and not in_xml_tool_call:
+            if self.stream and not in_tool_call and not in_xml_tool_call and not in_thinking:
                 if any(
                     sequence_overlap(tokens, sequence)
                     for sequence in ctx.stop_token_sequences
