@@ -1370,15 +1370,16 @@ class APIHandler(BaseHTTPRequestHandler):
             clean_text, extracted = self._extract_tool_calls_from_text(text)
             all_tool_calls = tool_calls + extracted
 
-        def parse_function(tool_text):
+        def parse_function(tool_text, index=0):
             tool_call = json.loads(tool_text.strip())
             return {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
                 "function": {
                     "name": tool_call.get("name", None),
                     "arguments": json.dumps(tool_call.get("arguments", "")),
                 },
-                "type": "function",
-                "id": None,
+                "index": index,
             }
 
         # Static response
@@ -1427,7 +1428,7 @@ class APIHandler(BaseHTTPRequestHandler):
             choice[key_name] = {
                 "role": "assistant",
                 "content": clean_text,
-                "tool_calls": [parse_function(t) for t in normalized] if normalized else None,
+                "tool_calls": [parse_function(t, i) for i, t in enumerate(normalized)] if normalized else None,
             }
             # Update finish_reason if tool calls present
             if normalized and finish_reason == "stop":
@@ -1446,9 +1447,21 @@ class APIHandler(BaseHTTPRequestHandler):
             return text
 
         clean = text
+        # Strip thinking content (everything between <think> and </think>)
         clean = re.sub(r'<think>.*?</think>', '', clean, flags=re.DOTALL)
+        # Handle unclosed <think> tags (strip from <think> to end)
         clean = re.sub(r'<think>.*$', '', clean, flags=re.DOTALL)
+        # Handle orphaned </think> - strip everything before it
         clean = re.sub(r'^.*?</think>', '', clean, flags=re.DOTALL)
+
+        # If no </think> was found but there's a tool call, strip content before tool call
+        # (model output thinking without closing tag)
+        if '</think>' not in text and '<minimax:tool_call>' in clean:
+            clean = re.sub(r'^.*?(?=<minimax:tool_call>)', '', clean, flags=re.DOTALL)
+        elif '</think>' not in text and '<invoke' in clean:
+            clean = re.sub(r'^.*?(?=<invoke)', '', clean, flags=re.DOTALL)
+
+        # Clean other artifacts
         clean = re.sub(r'\[e~\[', '', clean)
         clean = re.sub(r'⏺', '', clean)
         clean = re.sub(r'\]~b\][a-z]+', '', clean)
@@ -1471,14 +1484,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         def extract_and_filter(tool_text: str) -> List[str]:
             """Parse tool calls and optionally filter by schema."""
-            import copy
             result = []
             for p in parse_minimax_tool_calls(tool_text):
                 if tools:
-                    original_args = copy.deepcopy(p.get("arguments", {}))
                     p = filter_tool_call_by_schema(p, tools)
-                    if original_args != p.get("arguments", {}):
-                        logging.info(f"Filtered tool call '{p.get('name')}': removed extra properties from arguments")
                 result.append(json.dumps(p))
             return result
 
@@ -1755,9 +1764,9 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
 
-        # Variables to save the generated text
         text = ""
         segment = ""
+        text_sent_length = 0
 
         # Well finally save the reason for stopping
         finish_reason = "length"
@@ -1836,6 +1845,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         )
                         self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                         self.wfile.flush()
+                        text_sent_length = len(text)
                         segment = ""
                         tool_calls = []
 
@@ -1848,8 +1858,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     text, finish_reason, tool_calls, len(ctx.prompt), len(tokens)
                 )
             else:
-                # Use full text when XML tool calls detected, otherwise use segment
-                final_text = text if in_xml_tool_call else segment
+                final_text = text[text_sent_length:] if in_xml_tool_call else segment
                 response = self.generate_response(
                     final_text, finish_reason, tool_calls=tool_calls
                 )
@@ -2144,20 +2153,20 @@ def main():
     parser.add_argument(
         "--temp",
         type=float,
-        default=0.0,
-        help="Default sampling temperature (default: 0.0)",
+        default=1.0,
+        help="Default sampling temperature (default: 1.0)",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=1.0,
-        help="Default nucleus sampling top-p (default: 1.0)",
+        default=0.95,
+        help="Default nucleus sampling top-p (default: 0.95)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=0,
-        help="Default top-k sampling (default: 0, disables top-k)",
+        default=40,
+        help="Default top-k sampling (default: 40)",
     )
     parser.add_argument(
         "--min-p",
@@ -2168,8 +2177,8 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
-        help="Default maximum number of tokens to generate (default: 512)",
+        default=128000,
+        help="Default maximum number of tokens to generate (default: 128000)",
     )
     parser.add_argument(
         "--chat-template-args",
