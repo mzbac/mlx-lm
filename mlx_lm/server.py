@@ -62,6 +62,7 @@ def stopping_criteria(
     stop_id_sequences: List[List[int]],
     stop_words: List[str],
     eos_token_id: Union[int, None],
+    eos_token: str = "",
 ) -> StopCondition:
     """
     Determines whether the token generation should stop based on predefined
@@ -77,6 +78,8 @@ def stopping_criteria(
         eos_token_id (Union[int, None]): The token ID that represents the
           end-of-sequence. If the last token in `tokens` matches this, the
           generation should stop.
+        eos_token (str): The text representation of the EOS token, used to
+          determine trim_text_length.
 
     Returns:
         StopCondition: A named tuple indicating whether the stop condition has
@@ -85,7 +88,7 @@ def stopping_criteria(
           trimmed.
     """
     if tokens and tokens[-1] == eos_token_id:
-        return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
+        return StopCondition(stop_met=True, trim_length=0, trim_text_length=len(eos_token))
 
     for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
         if len(tokens) >= len(stop_ids):
@@ -143,7 +146,8 @@ def process_message_content(messages):
     Convert message content to a format suitable for `apply_chat_template`.
 
     The function operates on messages in place. It converts the 'content' field
-    to a string instead of a list of text fragments.
+    to a string instead of a list of text fragments. It also parses tool_call
+    arguments from JSON strings to dicts for chat templates that iterate over them.
 
     Args:
         message_list (list): A list of dictionaries, where each dictionary may
@@ -155,7 +159,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -166,13 +170,29 @@ def process_message_content(messages):
         elif content is None:
             message["content"] = ""
 
+        # Parse tool_call arguments from JSON string to dict for chat templates
+        # that call .items() on arguments (e.g., MiniMax)
+        if "tool_calls" in message:
+            for tool_call in message["tool_calls"]:
+                func = tool_call.get("function", tool_call)
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        func["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        func["arguments"] = {}
 
-def convert_anthropic_messages(body: dict) -> List[dict]:
-    """Convert Anthropic API messages format to internal chat format.
+
+def convert_anthropic_to_openai_messages(body: dict) -> List[dict]:
+    """Convert Anthropic API messages to OpenAI format for chat template compatibility.
 
     Handles:
     - system field (string or list of content blocks)
     - message content blocks (text, tool_use, tool_result)
+
+    Converts:
+    - Anthropic tool_use blocks -> OpenAI tool_calls array
+    - Anthropic tool_result blocks -> OpenAI role: "tool" messages
     """
     messages = []
 
@@ -182,7 +202,6 @@ def convert_anthropic_messages(body: dict) -> List[dict]:
         if isinstance(system, str):
             messages.append({"role": "system", "content": system})
         elif isinstance(system, list):
-            # List of content blocks
             text = "".join(
                 b.get("text", "") for b in system if b.get("type") == "text"
             )
@@ -197,27 +216,46 @@ def convert_anthropic_messages(body: dict) -> List[dict]:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
-            # Handle content blocks
             text_parts = []
+            tool_calls = []
+            tool_results = []
+
             for block in content:
                 block_type = block.get("type")
                 if block_type == "text":
                     text_parts.append(block.get("text", ""))
                 elif block_type == "tool_use":
-                    # Include tool use as text for context
-                    name = block.get("name", "")
-                    input_data = block.get("input", {})
-                    text_parts.append(f"[Tool call: {name}({json.dumps(input_data)})]")
+                    tool_calls.append({
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": block.get("input", {}),
+                        },
+                    })
                 elif block_type == "tool_result":
-                    # Flatten tool result for the model
                     tool_id = block.get("tool_use_id", "")
                     result = block.get("content", "")
                     if isinstance(result, list):
                         result = "".join(
                             b.get("text", "") for b in result if b.get("type") == "text"
                         )
-                    text_parts.append(f"[Tool result ({tool_id}): {result}]")
-            messages.append({"role": role, "content": "".join(text_parts)})
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": result,
+                    })
+
+            if role == "assistant":
+                msg_dict = {"role": "assistant", "content": "".join(text_parts) or None}
+                if tool_calls:
+                    msg_dict["tool_calls"] = tool_calls
+                messages.append(msg_dict)
+            elif tool_results:
+                for tool_result in tool_results:
+                    messages.append(tool_result)
+            else:
+                messages.append({"role": role, "content": "".join(text_parts)})
         else:
             messages.append({"role": role, "content": ""})
 
@@ -245,21 +283,10 @@ def convert_anthropic_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]
 
 
 def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
-    """Parse MiniMax-style XML tool calls into standard JSON format.
-
-    MiniMax format:
-        <invoke name="tool-name">
-        <parameter name="param1">value1</parameter>
-        <parameter name="param2">value2</parameter>
-        </invoke>
-
-    Returns list of dicts with {"name": "...", "arguments": {...}}
-    """
+    """Parse MiniMax-style XML tool calls into standard JSON format."""
     import re
 
     tool_calls = []
-
-    # Find all <invoke> blocks
     invoke_pattern = re.compile(
         r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
         re.DOTALL
@@ -272,51 +299,105 @@ def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
     for match in invoke_pattern.finditer(tool_text):
         tool_name = match.group(1)
         invoke_body = match.group(2)
-
-        # Extract parameters
         arguments = {}
         for param_match in param_pattern.finditer(invoke_body):
             param_name = param_match.group(1)
             param_value = param_match.group(2).strip()
-
-            # Try to parse JSON values
             try:
                 arguments[param_name] = json.loads(param_value)
             except (json.JSONDecodeError, ValueError):
-                # Keep as string if not valid JSON
                 arguments[param_name] = param_value
-
-        tool_calls.append({
-            "name": tool_name,
-            "arguments": arguments,
-        })
+        tool_calls.append({"name": tool_name, "arguments": arguments})
 
     return tool_calls
 
 
 def normalize_tool_calls(tool_texts: List[str]) -> List[str]:
-    """Normalize tool call text from various formats to standard JSON.
-
-    Handles:
-    - Standard JSON format: {"name": "...", "arguments": {...}}
-    - MiniMax XML format: <invoke name="...">...</invoke>
-    - Other formats as-is
-    """
+    """Normalize tool call text from various formats to standard JSON."""
     normalized = []
-
     for tool_text in tool_texts:
         text = tool_text.strip()
-
-        # Check if it's MiniMax XML format
         if "<invoke" in text and "</invoke>" in text:
-            parsed_calls = parse_minimax_tool_calls(text)
-            for call in parsed_calls:
+            for call in parse_minimax_tool_calls(text):
                 normalized.append(json.dumps(call))
         else:
-            # Assume it's already JSON or pass through
             normalized.append(text)
-
     return normalized
+
+
+def filter_by_schema(value: Any, schema: dict) -> Any:
+    """
+    Recursively filter a value to only include properties allowed by the JSON schema.
+    This handles additionalProperties: false by removing extra keys.
+    """
+    if schema is None:
+        return value
+
+    schema_type = schema.get("type")
+
+    if schema_type == "object":
+        if not isinstance(value, dict):
+            return value
+
+        properties = schema.get("properties", {})
+        additional_props = schema.get("additionalProperties", True)
+
+        if additional_props is False:
+            # Only keep properties defined in schema
+            filtered = {}
+            for key, val in value.items():
+                if key in properties:
+                    prop_schema = properties[key]
+                    filtered[key] = filter_by_schema(val, prop_schema)
+            return filtered
+        else:
+            # Keep all properties but still filter nested ones
+            filtered = {}
+            for key, val in value.items():
+                if key in properties:
+                    filtered[key] = filter_by_schema(val, properties[key])
+                else:
+                    filtered[key] = val
+            return filtered
+
+    elif schema_type == "array":
+        if not isinstance(value, list):
+            return value
+
+        items_schema = schema.get("items", {})
+        return [filter_by_schema(item, items_schema) for item in value]
+
+    else:
+        return value
+
+
+def filter_tool_call_by_schema(tool_call: dict, tools: Optional[List[dict]]) -> dict:
+    """
+    Filter tool call arguments to match the tool's schema.
+    Removes extra properties when additionalProperties is false.
+    """
+    if not tools:
+        return tool_call
+
+    tool_name = tool_call.get("name")
+    arguments = tool_call.get("arguments", {})
+
+    # Find matching tool schema
+    for tool in tools:
+        # Handle both formats: {name, parameters} and {type: "function", function: {name, parameters}}
+        if tool.get("type") == "function":
+            func = tool.get("function", {})
+            name = func.get("name")
+            schema = func.get("parameters", {})
+        else:
+            name = tool.get("name")
+            schema = tool.get("parameters", {})
+
+        if name == tool_name and schema:
+            filtered_args = filter_by_schema(arguments, schema)
+            return {"name": tool_name, "arguments": filtered_args}
+
+    return tool_call
 
 
 class LRUPromptCache:
@@ -511,6 +592,7 @@ class GenerationContext:
     tool_call_start: str
     tool_call_end: str
     eos_token_id: int
+    eos_token: str
     stop_token_sequences: List[List[int]]
     prompt: List[int]
 
@@ -642,6 +724,52 @@ class ResponseGenerator:
 
             if tokenizer.chat_template:
                 process_message_content(messages)
+
+                # Normalize tool format for chat templates that expect
+                # name/description inside function object
+                if tools:
+                    normalized_tools = []
+                    for tool in tools:
+                        if tool.get("type") == "function":
+                            func = tool.get("function", {})
+                            # If name is at top level but not in function, move it
+                            if "name" in tool and "name" not in func:
+                                func = dict(func)
+                                func["name"] = tool["name"]
+                            if "description" in tool and "description" not in func:
+                                if not isinstance(func, dict) or func is tool.get("function"):
+                                    func = dict(func)
+                                func["description"] = tool["description"]
+                            normalized_tools.append({"type": "function", "function": func})
+                        else:
+                            normalized_tools.append(tool)
+                    tools = normalized_tools
+
+                # Merge consecutive assistant messages for chat templates that require
+                # tool messages to immediately follow assistant messages with tool_calls
+                merged_messages = []
+                for msg in messages:
+                    if (merged_messages and
+                        msg.get("role") == "assistant" and
+                        merged_messages[-1].get("role") == "assistant"):
+                        # Merge with previous assistant message
+                        prev = merged_messages[-1]
+                        # Combine content
+                        prev_content = prev.get("content") or ""
+                        curr_content = msg.get("content") or ""
+                        if prev_content and curr_content:
+                            prev["content"] = prev_content + "\n" + curr_content
+                        elif curr_content:
+                            prev["content"] = curr_content
+                        # Merge tool_calls
+                        if "tool_calls" in msg and msg["tool_calls"]:
+                            if "tool_calls" not in prev:
+                                prev["tool_calls"] = []
+                            prev["tool_calls"].extend(msg["tool_calls"])
+                    else:
+                        merged_messages.append(msg)
+                messages = merged_messages
+
                 return tokenizer.apply_chat_template(
                     messages,
                     tools,
@@ -727,6 +855,7 @@ class ResponseGenerator:
                         tool_call_start=tokenizer.tool_call_start,
                         tool_call_end=tokenizer.tool_call_end,
                         eos_token_id=tokenizer.eos_token_id,
+                        eos_token=tokenizer.eos_token or "",
                         stop_token_sequences=[
                             tokenizer.encode(stop_word, add_special_tokens=False)
                             for stop_word in args.stop_words
@@ -886,6 +1015,7 @@ class ResponseGenerator:
                 tool_call_start=tokenizer.tool_call_start,
                 tool_call_end=tokenizer.tool_call_end,
                 eos_token_id=tokenizer.eos_token_id,
+                eos_token=tokenizer.eos_token or "",
                 stop_token_sequences=[
                     tokenizer.encode(stop_word, add_special_tokens=False)
                     for stop_word in args.stop_words
@@ -1086,7 +1216,12 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
-        self.requested_model = self.body.get("model", "default_model")
+        # Map Anthropic/Claude model names to default_model for local inference
+        requested_model = self.body.get("model", "default_model")
+        if requested_model.startswith(("claude-", "anthropic")):
+            self.requested_model = "default_model"
+        else:
+            self.requested_model = requested_model
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
@@ -1228,6 +1363,14 @@ class APIHandler(BaseHTTPRequestHandler):
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
 
+        # Only extract/clean for final response, not incremental streaming chunks
+        if self.stream and finish_reason is None:
+            clean_text = text
+            all_tool_calls = tool_calls
+        else:
+            clean_text, extracted = self._extract_tool_calls_from_text(text)
+            all_tool_calls = tool_calls + extracted
+
         def parse_function(tool_text):
             tool_call = json.loads(tool_text.strip())
             return {
@@ -1281,17 +1424,85 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
+            normalized = normalize_tool_calls(all_tool_calls)
             choice[key_name] = {
                 "role": "assistant",
-                "content": text,
-                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+                "content": clean_text,
+                "tool_calls": [parse_function(t) for t in normalized] if normalized else None,
             }
+            # Update finish_reason if tool calls present
+            if normalized and finish_reason == "stop":
+                choice["finish_reason"] = "tool_calls"
         elif self.object_type == "text_completion":
-            choice.update(text=text)
+            choice.update(text=clean_text)
         else:
             raise ValueError(f"Unsupported response type: {self.object_type}")
 
         return response
+
+    def _extract_tool_calls_from_text(self, text: str) -> Tuple[str, List[str]]:
+        """Extract tool calls from text and return cleaned text with tool call list.
+
+        Automatically filters out extra properties based on tool schema
+        (handles additionalProperties: false) using self.body.get("tools").
+        """
+        import re
+
+        extracted = []
+        clean_text = text
+
+        # Get tools from request body for schema filtering
+        tools = getattr(self, 'body', {}).get("tools") if hasattr(self, 'body') else None
+
+        def extract_and_filter(tool_text: str) -> List[str]:
+            """Parse tool calls and optionally filter by schema."""
+            import copy
+            result = []
+            for p in parse_minimax_tool_calls(tool_text):
+                if tools:
+                    original_args = copy.deepcopy(p.get("arguments", {}))
+                    p = filter_tool_call_by_schema(p, tools)
+                    if original_args != p.get("arguments", {}):
+                        logging.info(f"Filtered tool call '{p.get('name')}': removed extra properties from arguments")
+                result.append(json.dumps(p))
+            return result
+
+        # Extract <minimax:tool_call> blocks
+        if text and "<minimax:tool_call>" in text:
+            pattern = re.compile(
+                r'<minimax:tool_call>(.*?)(?:</minimax:tool_call>|\[e~\[|$)', re.DOTALL
+            )
+            for match in pattern.finditer(text):
+                extracted.extend(extract_and_filter(match.group(1).strip()))
+            clean_text = pattern.sub('', text)
+
+            # Fallback: direct <invoke> extraction if wrapper didn't match
+            if not extracted and '<invoke' in text:
+                extracted.extend(extract_and_filter(text))
+                if extracted:
+                    invoke_pattern = re.compile(
+                        r'<invoke\s+name=["\'][^"\']+["\']>.*?</invoke>', re.DOTALL
+                    )
+                    clean_text = invoke_pattern.sub('', clean_text)
+
+        # Direct <invoke> extraction without wrapper
+        elif text and '<invoke' in text and '</invoke>' in text:
+            extracted.extend(extract_and_filter(text))
+            if extracted:
+                invoke_pattern = re.compile(
+                    r'<invoke\s+name=["\'][^"\']+["\']>.*?</invoke>', re.DOTALL
+                )
+                clean_text = invoke_pattern.sub('', text)
+
+        # Clean up model artifacts from text
+        if clean_text:
+            clean_text = re.sub(r'</?think>', '', clean_text)
+            clean_text = re.sub(r'\[e~\[', '', clean_text)
+            clean_text = re.sub(r'⏺', '', clean_text)
+            clean_text = re.sub(r'</?minimax:tool_call>', '', clean_text)
+            clean_text = re.sub(r'\]~b\][a-z]+', '', clean_text)
+
+        return clean_text, extracted
 
     def generate_anthropic_response(
         self,
@@ -1301,30 +1512,16 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_token_count: Optional[int] = None,
         tool_calls: Optional[List[str]] = None,
     ) -> dict:
-        """
-        Generate an Anthropic-format response.
-
-        Args:
-            text (str): Text generated by model
-            finish_reason (Optional[str]): The reason generation stopped
-            prompt_token_count (Optional[int]): Number of input tokens
-            completion_token_count (Optional[int]): Number of output tokens
-            tool_calls (Optional[List[str]]): List of tool call JSON strings
-
-        Returns:
-            dict: Anthropic API format response
-        """
+        """Generate an Anthropic-format response."""
         content = []
 
-        # Add text content if present
-        if text:
-            content.append({"type": "text", "text": text})
+        clean_text, extracted = self._extract_tool_calls_from_text(text)
+        if clean_text:
+            content.append({"type": "text", "text": clean_text})
 
-        # Normalize tool calls (handles MiniMax XML format and others)
-        normalized_calls = normalize_tool_calls(tool_calls or [])
-
-        # Add tool use blocks
-        for tool_text in normalized_calls:
+        # Combine and normalize tool calls
+        all_tool_calls = (tool_calls or []) + extracted
+        for tool_text in normalize_tool_calls(all_tool_calls):
             try:
                 tool_data = json.loads(tool_text.strip())
                 content.append({
@@ -1336,13 +1533,16 @@ class APIHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 pass
 
-        # Map finish reason to Anthropic format
+        # Set stop_reason based on content
+        has_tool_use = any(block.get("type") == "tool_use" for block in content)
+        if has_tool_use:
+            finish_reason = "tool_calls"
+
         stop_reason_map = {
             "stop": "end_turn",
             "length": "max_tokens",
             "tool_calls": "tool_use",
         }
-        stop_reason = stop_reason_map.get(finish_reason, finish_reason)
 
         response = {
             "id": self.request_id,
@@ -1350,7 +1550,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "role": "assistant",
             "model": self.requested_model,
             "content": content,
-            "stop_reason": stop_reason,
+            "stop_reason": stop_reason_map.get(finish_reason, finish_reason),
         }
 
         if prompt_token_count is not None and completion_token_count is not None:
@@ -1369,99 +1569,89 @@ class APIHandler(BaseHTTPRequestHandler):
         input_tokens: int,
         output_tokens: int,
     ):
-        """
-        Send Anthropic-format SSE streaming events.
+        """Send Anthropic-format SSE streaming events."""
+        clean_text, extracted = self._extract_tool_calls_from_text(text)
+        all_tool_calls = (tool_calls or []) + extracted
 
-        Event sequence: message_start -> content_block_start -> content_block_delta
-                       -> content_block_stop -> message_delta -> message_stop
-        """
+        if all_tool_calls:
+            finish_reason = "tool_calls"
+
         # message_start
-        message_start = {
-            "type": "message_start",
-            "message": {
-                "id": self.request_id,
-                "type": "message",
-                "role": "assistant",
-                "model": self.requested_model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        self.wfile.write(f"event: message_start\ndata: {json.dumps({
+            'type': 'message_start',
+            'message': {
+                'id': self.request_id,
+                'type': 'message',
+                'role': 'assistant',
+                'model': self.requested_model,
+                'content': [],
+                'stop_reason': None,
+                'stop_sequence': None,
+                'usage': {'input_tokens': input_tokens, 'output_tokens': 0},
             },
-        }
-        self.wfile.write(f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode())
+        })}\n\n".encode())
 
-        # content_block_start (text)
-        block_start = {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        }
-        self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+        # Text content block
+        self.wfile.write(f"event: content_block_start\ndata: {json.dumps({
+            'type': 'content_block_start',
+            'index': 0,
+            'content_block': {'type': 'text', 'text': ''},
+        })}\n\n".encode())
 
-        # content_block_delta
-        if text:
-            delta = {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text},
-            }
-            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+        if clean_text:
+            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'text_delta', 'text': clean_text},
+            })}\n\n".encode())
 
-        # content_block_stop
-        block_stop = {"type": "content_block_stop", "index": 0}
-        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({
+            'type': 'content_block_stop', 'index': 0
+        })}\n\n".encode())
 
-        # Handle tool calls if present (normalize for MiniMax XML format)
-        normalized_calls = normalize_tool_calls(tool_calls or [])
+        # Tool use blocks
         block_index = 1
-        for tool_text in normalized_calls:
+        for tool_text in normalize_tool_calls(all_tool_calls):
             try:
                 tool_data = json.loads(tool_text.strip())
-                # tool_use content_block_start
-                tool_block = {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                        "name": tool_data.get("name", ""),
-                        "input": {},
-                    },
-                }
-                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_block)}\n\n".encode())
+                tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
 
-                # input_json_delta
-                input_delta = {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(tool_data.get("arguments", {})),
+                self.wfile.write(f"event: content_block_start\ndata: {json.dumps({
+                    'type': 'content_block_start',
+                    'index': block_index,
+                    'content_block': {
+                        'type': 'tool_use',
+                        'id': tool_id,
+                        'name': tool_data.get('name', ''),
+                        'input': {},
                     },
-                }
-                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n".encode())
+                })}\n\n".encode())
 
-                # content_block_stop
-                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode())
+                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps({
+                    'type': 'content_block_delta',
+                    'index': block_index,
+                    'delta': {
+                        'type': 'input_json_delta',
+                        'partial_json': json.dumps(tool_data.get('arguments', {})),
+                    },
+                })}\n\n".encode())
+
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps({
+                    'type': 'content_block_stop', 'index': block_index
+                })}\n\n".encode())
                 block_index += 1
             except json.JSONDecodeError:
                 pass
 
-        # message_delta with stop_reason and usage
-        stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
-            finish_reason, finish_reason
-        )
-        message_delta = {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
-        }
-        self.wfile.write(f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n".encode())
+        # message_delta and message_stop
+        stop_reason_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+        self.wfile.write(f"event: message_delta\ndata: {json.dumps({
+            'type': 'message_delta',
+            'delta': {'stop_reason': stop_reason_map.get(finish_reason, finish_reason), 'stop_sequence': None},
+            'usage': {'output_tokens': output_tokens},
+        })}\n\n".encode())
 
-        # message_stop
         self.wfile.write(f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode())
-
         self.wfile.flush()
 
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
@@ -1537,9 +1727,9 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
-        # Variables to save the tool calls in as they are being generated by
-        # the model.
+        # Variables to save the tool calls in as they are being generated
         in_tool_call = False
+        in_xml_tool_call = False  # For inline XML tool calls (<invoke>, <minimax:tool_call>)
         tool_calls = []
         tool_text = ""
 
@@ -1573,6 +1763,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 text += gen.text
                 segment += gen.text
 
+                # Detect inline XML tool calls for models without special tokens
+                if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text):
+                    in_xml_tool_call = True
+
             # Save the token and its logprob
             tokens.append(gen.token)
             token_logprobs.append(gen.logprob)
@@ -1583,7 +1777,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Check if we should stop early
             stop_condition = stopping_criteria(
-                tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id
+                tokens, ctx.stop_token_sequences, stop_words, ctx.eos_token_id, ctx.eos_token
             )
             if stop_condition.stop_met:
                 finish_reason = "stop"
@@ -1593,19 +1787,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 segment = ""
                 break
 
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
+            if self.stream and not in_tool_call and not in_xml_tool_call:
                 if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in ctx.stop_token_sequences
-                    )
+                    sequence_overlap(tokens, sequence)
+                    for sequence in ctx.stop_token_sequences
                 ):
                     continue
                 elif segment or tool_calls:
-                    # For Anthropic, we send everything at the end via _send_anthropic_stream_events
-                    # For OpenAI, we send incremental chunks
                     if not self.is_anthropic:
                         response = self.generate_response(
                             segment, None, tool_calls=tool_calls
@@ -1620,14 +1808,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.stream:
             if self.is_anthropic:
-                # Send Anthropic-format streaming response
                 self._send_anthropic_stream_events(
                     text, finish_reason, tool_calls, len(ctx.prompt), len(tokens)
                 )
             else:
-                # Send OpenAI-format streaming response
+                # Use full text when XML tool calls detected, otherwise use segment
+                final_text = text if in_xml_tool_call else segment
                 response = self.generate_response(
-                    segment, finish_reason, tool_calls=tool_calls
+                    final_text, finish_reason, tool_calls=tool_calls
                 )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
@@ -1639,7 +1827,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         else:
             if self.is_anthropic:
-                # Send Anthropic-format response
                 response = self.generate_anthropic_response(
                     text,
                     finish_reason,
@@ -1648,7 +1835,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls=tool_calls,
                 )
             else:
-                # Send OpenAI-format response
                 response = self.generate_response(
                     text,
                     finish_reason,
@@ -1748,7 +1934,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.is_anthropic = True
 
         # Convert messages from Anthropic format
-        messages = convert_anthropic_messages(body)
+        messages = convert_anthropic_to_openai_messages(body)
         tools = convert_anthropic_tools(body.get("tools"))
 
         return CompletionRequest(
