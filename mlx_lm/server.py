@@ -312,6 +312,54 @@ def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
     return tool_calls
 
 
+def parse_devstral_tool_calls(text: str) -> List[dict]:
+    """Parse Devstral-style [TOOL_CALLS]name[ARGS]json tool calls.
+
+    Devstral (Mistral) models use this format for tool calling:
+    [TOOL_CALLS]function_name[ARGS]{"arg": "value"}
+
+    Multiple tool calls can appear in sequence.
+    """
+    import re
+
+    tool_calls = []
+    # Pattern: [TOOL_CALLS]function_name[ARGS]json_args
+    # The JSON args continue until the next [TOOL_CALLS], end of string, or EOS token
+    # We use a greedy match for function name (word chars) and then capture the JSON object
+    pattern = re.compile(
+        r'\[TOOL_CALLS\](\w+)\[ARGS\](\{.*?\})(?=\[TOOL_CALLS\]|</s>|$)',
+        re.DOTALL
+    )
+
+    for match in pattern.finditer(text):
+        func_name = match.group(1)
+        args_str = match.group(2)
+        try:
+            arguments = json.loads(args_str)
+        except (json.JSONDecodeError, ValueError):
+            # Try to extract valid JSON by finding balanced braces
+            brace_count = 0
+            end_idx = 0
+            for i, char in enumerate(args_str):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            if end_idx > 0:
+                try:
+                    arguments = json.loads(args_str[:end_idx])
+                except (json.JSONDecodeError, ValueError):
+                    arguments = {}
+            else:
+                arguments = {}
+        tool_calls.append({"name": func_name, "arguments": arguments})
+
+    return tool_calls
+
+
 def normalize_tool_calls(tool_texts: List[str]) -> List[str]:
     """Normalize tool call text from various formats to standard JSON."""
     normalized = []
@@ -1495,8 +1543,28 @@ class APIHandler(BaseHTTPRequestHandler):
                 result.append(json.dumps(p))
             return result
 
+        def extract_and_filter_devstral(full_text: str) -> List[str]:
+            """Parse Devstral tool calls and optionally filter by schema."""
+            result = []
+            for p in parse_devstral_tool_calls(full_text):
+                if tools:
+                    p = filter_tool_call_by_schema(p, tools)
+                result.append(json.dumps(p))
+            return result
+
+        # Extract Devstral-style [TOOL_CALLS]name[ARGS]json blocks
+        if text and "[TOOL_CALLS]" in text:
+            extracted.extend(extract_and_filter_devstral(text))
+            if extracted:
+                # Remove the tool call markers and content from the text
+                devstral_pattern = re.compile(
+                    r'\[TOOL_CALLS\]\w+\[ARGS\]\{.*?\}(?=\[TOOL_CALLS\]|</s>|$)',
+                    re.DOTALL
+                )
+                clean_text = devstral_pattern.sub('', text)
+
         # Extract <minimax:tool_call> blocks
-        if text and "<minimax:tool_call>" in text:
+        elif text and "<minimax:tool_call>" in text:
             pattern = re.compile(
                 r'<minimax:tool_call>(.*?)(?:</minimax:tool_call>|\[e~\[|$)', re.DOTALL
             )
@@ -1527,6 +1595,8 @@ class APIHandler(BaseHTTPRequestHandler):
             clean_text = self._clean_thinking_content(clean_text)
             # Also clean minimax tool call tags (already extracted above)
             clean_text = re.sub(r'</?minimax:tool_call>', '', clean_text)
+            # Clean any remaining Devstral markers
+            clean_text = re.sub(r'\[TOOL_CALLS\]|\[ARGS\]|\[/TOOL_RESULTS\]|\[TOOL_RESULTS\]', '', clean_text)
 
         return clean_text, extracted
 
@@ -1813,7 +1883,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         in_thinking = False
 
                 # Detect inline XML tool calls for models without special tokens
-                if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text):
+                # Also detect Devstral [TOOL_CALLS] marker
+                if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text or "[TOOL_CALLS]" in text):
                     in_xml_tool_call = True
 
             # Save the token and its logprob
