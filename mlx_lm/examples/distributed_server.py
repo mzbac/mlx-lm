@@ -454,7 +454,7 @@ class LRUPromptCache:
         longer: List[int]
         common_prefix: int
 
-    def __init__(self, max_size: int = 10):
+    def __init__(self, max_size: int = 2):
         self.max_size = max_size
         self._cache = {}
         self._lru = deque()
@@ -1839,7 +1839,7 @@ def generation_loop(dist_state, model, tokenizer, args, prompt_cache_store=None)
     
     # Initialize prompt cache store if not provided
     if prompt_cache_store is None:
-        prompt_cache_store = LRUPromptCache(max_size=10)
+        prompt_cache_store = LRUPromptCache(max_size=max(0, int(args.prompt_cache_size)))
 
     while True:
         # All ranks sync and check for requests
@@ -2080,6 +2080,12 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=40)
+    parser.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=2,
+        help="Maximum number of prompt-cache entries to keep (LRU). Set to 0 to disable.",
+    )
 
     args = parser.parse_args()
 
