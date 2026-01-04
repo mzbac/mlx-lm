@@ -3,11 +3,21 @@
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+import logging
 import mlx.core as mx
+import os
+import time
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
+
+try:
+    from mlx.nn.layers.distributed import shard_linear, shard_inplace, sum_gradients
+except ImportError:
+    shard_linear = None
+    shard_inplace = None
+    sum_gradients = None
 
 
 @dataclass
@@ -112,6 +122,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.num_experts_per_tok = args.num_experts_per_tok
+        self.num_experts = args.num_local_experts
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
         self.switch_mlp = SwitchGLU(
@@ -135,6 +146,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
+        
         return y
 
 
@@ -162,16 +174,49 @@ class MiniMaxDecoderLayer(nn.Module):
         return r
 
 
-class MiniMaxModel(nn.Module):
+from .pipeline import PipelineMixin
+
+
+class MiniMaxModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
-        super().__init__()
+        PipelineMixin.__init__(self)
+        nn.Module.__init__(self)
+        self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
 
         self.layers = [
-            MiniMaxDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            MiniMaxDecoderLayer(args=args) 
+            for _ in range(args.num_hidden_layers)
         ]
 
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def pipeline(self, group):
+        split = os.environ.get("MINIMAX_PIPELINE_SPLIT")
+        if not split:
+            return PipelineMixin.pipeline(self, group)
+
+        counts = [int(x.strip()) for x in split.split(",") if x.strip()]
+        if len(counts) != group.size():
+            raise ValueError(
+                f"MINIMAX_PIPELINE_SPLIT expects {group.size()} entries but got {len(counts)}"
+            )
+        total_layers = len(self.layers)
+        if sum(counts) != total_layers:
+            raise ValueError(
+                f"MINIMAX_PIPELINE_SPLIT must sum to {total_layers} layers but got {sum(counts)}"
+            )
+
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+
+        # Rank 0 is the last stage; rank N-1 is the first stage.
+        prefix = sum(counts[: self.pipeline_rank])
+        self.end_idx = total_layers - prefix
+        self.start_idx = self.end_idx - counts[self.pipeline_rank]
+
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
 
     def __call__(
         self,
@@ -179,17 +224,99 @@ class MiniMaxModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        trace = os.environ.get("MINIMAX_PIPELINE_TRACE") == "1"
+        if trace:
+            limit = int(os.environ.get("MINIMAX_PIPELINE_TRACE_LIMIT", "4") or 4)
+            call_n = getattr(self, "_trace_call_n", 0)
+            setattr(self, "_trace_call_n", call_n + 1)
+            trace = call_n < limit
+
+        if trace:
+            t0 = time.perf_counter()
+            logging.info(
+                "minimax: fwd begin rank=%d/%d inputs=%s start=%d end=%d",
+                getattr(self, "pipeline_rank", -1),
+                getattr(self, "pipeline_size", -1),
+                tuple(inputs.shape),
+                getattr(self, "start_idx", -1),
+                getattr(self, "end_idx", -1),
+            )
+
+        # Always embed tokens first (needed for mask computation)
         h = self.embed_tokens(inputs)
+        if trace:
+            logging.info("minimax: embed done dt=%.3fs", time.perf_counter() - t0)
+        mx.eval(h)  # Sync point for pipeline
+        if trace:
+            logging.info("minimax: embed eval done dt=%.3fs", time.perf_counter() - t0)
+
+        # Get the number of actual layers on this rank
+        local_layers = self.pipeline_layers  # Uses start_idx:end_idx
+        num_local_layers = len(local_layers)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * num_local_layers
 
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0] if cache else None)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
 
-        return self.norm(h)
+        # Receive hidden states from previous rank in pipeline
+        if pipeline_size > 1 and pipeline_rank < pipeline_size - 1:
+            if trace:
+                logging.info(
+                    "minimax: recv_like begin dt=%.3fs src=%d",
+                    time.perf_counter() - t0,
+                    pipeline_rank + 1,
+                )
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+            mx.eval(h)  # Sync point: ensure recv completes
+            if trace:
+                logging.info("minimax: recv_like done dt=%.3fs", time.perf_counter() - t0)
+
+        # Process layers for this rank
+        for i, layer in enumerate(local_layers):
+            layer_cache = cache[i] if i < len(cache) else None
+            h = layer(h, mask, layer_cache)
+        mx.eval(h)  # Sync point: ensure layers complete
+        if trace:
+            logging.info("minimax: layers done dt=%.3fs", time.perf_counter() - t0)
+
+        # Send to next rank in pipeline
+        if pipeline_size > 1 and pipeline_rank != 0:
+            if trace:
+                logging.info(
+                    "minimax: send begin dt=%.3fs dst=%d",
+                    time.perf_counter() - t0,
+                    (pipeline_rank - 1) % pipeline_size,
+                )
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            mx.eval(h)  # Sync point: ensure send completes
+            if trace:
+                logging.info("minimax: send done dt=%.3fs", time.perf_counter() - t0)
+
+        # Broadcast final hidden states (rank 0) to all ranks.
+        #
+        # all_gather is conceptually fine here, but we've observed it can hang on
+        # multi-machine ring runs. Since we only need rank 0's output, use an
+        # all_sum-based broadcast instead: rank 0 contributes `h`, other ranks
+        # contribute zeros.
+        if pipeline_size > 1:
+            if trace:
+                logging.info("minimax: broadcast(all_sum) begin dt=%.3fs", time.perf_counter() - t0)
+            h_sum = h if pipeline_rank == 0 else mx.zeros_like(h)
+            h = mx.distributed.all_sum(h_sum)
+            mx.eval(h)  # Sync point: ensure broadcast completes
+            if trace:
+                logging.info("minimax: broadcast(all_sum) done dt=%.3fs", time.perf_counter() - t0)
+
+        result = self.norm(h)
+        mx.eval(result)  # Sync point: ensure norm completes
+        if trace:
+            logging.info("minimax: norm done dt=%.3fs", time.perf_counter() - t0)
+        
+        return result
 
 
 class Model(nn.Module):
@@ -268,7 +395,13 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        """Return only the layers for this rank (local layers in pipeline mode)."""
+        return self.model.pipeline_layers
+    
+    def make_cache(self):
+        """Create cache for local layers only."""
+        from .cache import KVCache
+        return [KVCache() for _ in self.layers]
 
     @property
     def cast_predicate(self):

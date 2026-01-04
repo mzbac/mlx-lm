@@ -5,9 +5,11 @@ import glob
 import importlib
 import inspect
 import json
+import logging
 import os
 import resource
 import shutil
+import time
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -333,6 +335,26 @@ def sharded_load(
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
 ):
+    t0 = time.perf_counter()
+    rank = None
+    if pipeline_group is not None:
+        try:
+            rank = pipeline_group.rank()
+        except Exception:
+            rank = None
+    elif tensor_group is not None:
+        try:
+            rank = tensor_group.rank()
+        except Exception:
+            rank = None
+
+    logging.info(
+        "sharded_load: start repo=%s pipeline=%s tensor=%s rank=%s",
+        repo,
+        pipeline_group is not None,
+        tensor_group is not None,
+        rank,
+    )
     # Get model path with everything but weight safetensors
     model_path = _download(
         repo,
@@ -347,10 +369,13 @@ def sharded_load(
             "*.jinja",
         ],
     )
+    logging.info("sharded_load: downloaded config in %.3fs (%s)", time.perf_counter() - t0, model_path)
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
+    t_lazy0 = time.perf_counter()
     model, config = load_model(model_path, lazy=True, strict=False)
+    logging.info("sharded_load: inspected model in %.3fs", time.perf_counter() - t_lazy0)
 
     has_pipelining = hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
@@ -374,7 +399,9 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        t_pipe0 = time.perf_counter()
         model.model.pipeline(pipeline_group)
+        logging.info("sharded_load: configured pipeline in %.3fs", time.perf_counter() - t_pipe0)
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
@@ -389,25 +416,49 @@ def sharded_load(
             local_files.add(weight_index[k])
 
         # Download weights for local shard
+        t_dl0 = time.perf_counter()
         _download(repo, allow_patterns=local_files)
+        logging.info(
+            "sharded_load: downloaded %d shard files in %.3fs",
+            len(local_files),
+            time.perf_counter() - t_dl0,
+        )
     else:
+        t_dl0 = time.perf_counter()
         _download(repo)
+        logging.info("sharded_load: downloaded full weights in %.3fs", time.perf_counter() - t_dl0)
 
     # Load and shard the model, and load the weights
+    t_tok0 = time.perf_counter()
     tokenizer = load_tokenizer(
         model_path,
         {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
+    logging.info("sharded_load: loaded tokenizer in %.3fs", time.perf_counter() - t_tok0)
+
+    t_lazy1 = time.perf_counter()
     model, _ = load_model(model_path, lazy=True, strict=False)
+    logging.info("sharded_load: lazy-loaded model in %.3fs", time.perf_counter() - t_lazy1)
     if tensor_group is not None:
         model.shard(tensor_group)
     if pipeline_group is not None:
+        t_pipe1 = time.perf_counter()
         model.model.pipeline(pipeline_group)
+        logging.info("sharded_load: reconfigured pipeline in %.3fs", time.perf_counter() - t_pipe1)
+    
+    # Evaluate parameters
+    t_eval0 = time.perf_counter()
+    logging.info("sharded_load: mx.eval(model.parameters()) begin")
     mx.eval(model.parameters())
+    logging.info("sharded_load: mx.eval(model.parameters()) done in %.3fs", time.perf_counter() - t_eval0)
 
     # Synchronize processes to avoid timeout
+    t_bar0 = time.perf_counter()
+    logging.info("sharded_load: barrier all_sum begin")
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+    logging.info("sharded_load: barrier all_sum done in %.3fs", time.perf_counter() - t_bar0)
+    logging.info("sharded_load: finished in %.3fs", time.perf_counter() - t0)
     if return_config:
         return model, tokenizer, config
     else:

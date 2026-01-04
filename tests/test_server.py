@@ -1088,6 +1088,55 @@ class TestMiniMaxToolParsing(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["arguments"]["data"], {"key": "value", "count": 5})
 
+    def test_parse_path_with_tokenizer_spaces(self):
+        """Test parsing paths with tokenizer-induced spaces."""
+        tool_text = '''<invoke name="write_to_file">
+<parameter name="TargetFile">/Users/anchenli/dev/ playground/ index. html</parameter>
+<parameter name="content">hello</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        # Path should be normalized - spaces around / and . removed
+        self.assertEqual(result[0]["arguments"]["TargetFile"], "/Users/anchenli/dev/playground/index.html")
+        # Non-path content should be preserved as-is
+        self.assertEqual(result[0]["arguments"]["content"], "hello")
+
+    def test_parse_various_path_parameters(self):
+        """Test path normalization works for any parameter with path-like value."""
+        tool_text = '''<invoke name="file_op">
+<parameter name="AbsolutePath">/path/ to/ file .py</parameter>
+<parameter name="FilePath">/another/ path .txt</parameter>
+<parameter name="unknown_param">/also/ a/ path .js</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        # All paths should be normalized regardless of parameter name
+        self.assertEqual(result[0]["arguments"]["AbsolutePath"], "/path/to/file.py")
+        self.assertEqual(result[0]["arguments"]["FilePath"], "/another/path.txt")
+        self.assertEqual(result[0]["arguments"]["unknown_param"], "/also/a/path.js")
+
+    def test_parse_non_path_values_preserved(self):
+        """Test that non-path string values are NOT modified."""
+        tool_text = '''<invoke name="test">
+<parameter name="message">Hello . World / Test</parameter>
+<parameter name="description">This is a normal sentence.</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        # Non-paths should be preserved exactly (don't start with /)
+        self.assertEqual(result[0]["arguments"]["message"], "Hello . World / Test")
+        self.assertEqual(result[0]["arguments"]["description"], "This is a normal sentence.")
+
+    def test_parse_json_encoded_path_normalized(self):
+        """Test that JSON-encoded path strings are also normalized."""
+        tool_text = '''<invoke name="test">
+<parameter name="path">"/Users/ test/ file .py"</parameter>
+</invoke>'''
+        result = parse_minimax_tool_calls(tool_text)
+        self.assertEqual(len(result), 1)
+        # JSON string path should be normalized
+        self.assertEqual(result[0]["arguments"]["path"], "/Users/test/file.py")
+
 
 class TestStoppingCriteria(unittest.TestCase):
     """Tests for stopping_criteria function."""

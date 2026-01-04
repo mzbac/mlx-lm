@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import platform
+import re
 import socket
 import time
 import uuid
@@ -282,10 +283,34 @@ def convert_anthropic_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]
     ]
 
 
+def _minimax_is_path_like(value: str) -> bool:
+    # MiniMax frequently inserts spaces around path separators in tool-call args.
+    # Only normalize strings that look like file paths (absolute, home, or dot-relative).
+    return value.startswith(("/", "~/", "./", "../"))
+
+
+def _minimax_normalize_path_separators(value: str) -> str:
+    # Remove tokenizer-inserted spaces around "/" and "." (e.g. "/ Users / foo .py").
+    # Keep this conservative and only touch path-like strings.
+    if not value or not _minimax_is_path_like(value):
+        return value
+    value = re.sub(r"\s*/\s*", "/", value)
+    value = re.sub(r"\s*\.\s*", ".", value)
+    return value
+
+
+def _minimax_normalize_tool_arguments(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return _minimax_normalize_path_separators(obj)
+    if isinstance(obj, list):
+        return [_minimax_normalize_tool_arguments(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _minimax_normalize_tool_arguments(v) for k, v in obj.items()}
+    return obj
+
+
 def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
     """Parse MiniMax-style XML tool calls into standard JSON format."""
-    import re
-
     tool_calls = []
     invoke_pattern = re.compile(
         r'<invoke\s+name=["\']([^"\']+)["\']>(.*?)</invoke>',
@@ -304,10 +329,61 @@ def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
             param_name = param_match.group(1)
             param_value = param_match.group(2).strip()
             try:
-                arguments[param_name] = json.loads(param_value)
+                parsed = json.loads(param_value)
+                arguments[param_name] = _minimax_normalize_tool_arguments(parsed)
             except (json.JSONDecodeError, ValueError):
-                arguments[param_name] = param_value
+                arguments[param_name] = _minimax_normalize_path_separators(param_value)
         tool_calls.append({"name": tool_name, "arguments": arguments})
+
+    return tool_calls
+
+
+
+
+def parse_devstral_tool_calls(text: str) -> List[dict]:
+    """Parse Devstral-style [TOOL_CALLS]name[ARGS]json tool calls.
+
+    Devstral (Mistral) models use this format for tool calling:
+    [TOOL_CALLS]function_name[ARGS]{"arg": "value"}
+
+    Multiple tool calls can appear in sequence.
+    """
+    import re
+
+    tool_calls = []
+    # Pattern: [TOOL_CALLS]function_name[ARGS]json_args
+    # The JSON args continue until the next [TOOL_CALLS], end of string, or EOS token
+    # We use a greedy match for function name (word chars) and then capture the JSON object
+    pattern = re.compile(
+        r'\[TOOL_CALLS\](\w+)\[ARGS\](\{.*?\})(?=\[TOOL_CALLS\]|</s>|$)',
+        re.DOTALL
+    )
+
+    for match in pattern.finditer(text):
+        func_name = match.group(1)
+        args_str = match.group(2)
+        try:
+            arguments = json.loads(args_str)
+        except (json.JSONDecodeError, ValueError):
+            # Try to extract valid JSON by finding balanced braces
+            brace_count = 0
+            end_idx = 0
+            for i, char in enumerate(args_str):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            if end_idx > 0:
+                try:
+                    arguments = json.loads(args_str[:end_idx])
+                except (json.JSONDecodeError, ValueError):
+                    arguments = {}
+            else:
+                arguments = {}
+        tool_calls.append({"name": func_name, "arguments": arguments})
 
     return tool_calls
 
@@ -329,11 +405,33 @@ def filter_by_schema(value: Any, schema: dict) -> Any:
     """
     Recursively filter a value to only include properties allowed by the JSON schema.
     This handles additionalProperties: false by removing extra keys.
+
+    Also performs light type coercion for strict schemas (notably: coercing
+    non-strings into strings when schema requires type: "string"). This is
+    important for OpenAI-compatible tool calling clients that validate tool
+    arguments against JSON schema (e.g., opencode write.content).
     """
     if schema is None:
         return value
 
     schema_type = schema.get("type")
+    # Handle unions like {"type": ["string", "null"]}.
+    if isinstance(schema_type, list):
+        if value is None and "null" in schema_type:
+            return None
+        schema_type = next(
+            (t for t in schema_type if t != "null"),
+            schema_type[0] if schema_type else None,
+        )
+
+    # Coerce to string when required.
+    if schema_type == "string":
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
 
     if schema_type == "object":
         if not isinstance(value, dict):
@@ -382,6 +480,22 @@ def filter_tool_call_by_schema(tool_call: dict, tools: Optional[List[dict]]) -> 
     tool_name = tool_call.get("name")
     arguments = tool_call.get("arguments", {})
 
+    def schema_expects_string(s: Any) -> bool:
+        if not isinstance(s, dict):
+            return False
+        t = s.get("type")
+        if t == "string":
+            return True
+        if isinstance(t, list) and "string" in t:
+            return True
+        any_of = s.get("anyOf")
+        if isinstance(any_of, list):
+            return any(schema_expects_string(o) for o in any_of)
+        one_of = s.get("oneOf")
+        if isinstance(one_of, list):
+            return any(schema_expects_string(o) for o in one_of)
+        return False
+
     # Find matching tool schema
     for tool in tools:
         # Handle both formats: {name, parameters} and {type: "function", function: {name, parameters}}
@@ -395,6 +509,21 @@ def filter_tool_call_by_schema(tool_call: dict, tools: Optional[List[dict]]) -> 
 
         if name == tool_name and schema:
             filtered_args = filter_by_schema(arguments, schema)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                try:
+                    props = schema.get("properties", {}) if schema.get("type") == "object" else {}
+                    if isinstance(arguments, dict) and isinstance(filtered_args, dict) and isinstance(props, dict):
+                        for k, prop_schema in props.items():
+                            if not schema_expects_string(prop_schema):
+                                continue
+                            before = arguments.get(k)
+                            after = filtered_args.get(k)
+                            if before is not None and not isinstance(before, str) and isinstance(after, str):
+                                logging.debug(
+                                    f"Coerced tool arg to string: tool={tool_name}, arg={k}, from={type(before).__name__}"
+                                )
+                except Exception:
+                    logging.debug("Failed to debug tool arg coercions", exc_info=True)
             return {"name": tool_name, "arguments": filtered_args}
 
     return tool_call
@@ -783,6 +912,9 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _is_batchable(self, args):
+        # BatchGenerator doesn't support KV cache quantization
+        if self.model_provider.cli_args.kv_bits is not None:
+            return False
         if (
             args.model.draft != "default_model"
             or self.model_provider.cli_args.draft_model is not None
@@ -1058,6 +1190,9 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            kv_bits = self.model_provider.cli_args.kv_bits
+            if kv_bits is not None:
+                logging.info(f"Using quantized KV cache with {kv_bits} bits")
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1069,6 +1204,9 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                kv_bits=kv_bits,
+                kv_group_size=self.model_provider.cli_args.kv_group_size,
+                quantized_kv_start=self.model_provider.cli_args.quantized_kv_start,
             ):
                 top_tokens = None
                 if args.logprobs > 0:
@@ -1491,8 +1629,28 @@ class APIHandler(BaseHTTPRequestHandler):
                 result.append(json.dumps(p))
             return result
 
+        def extract_and_filter_devstral(full_text: str) -> List[str]:
+            """Parse Devstral tool calls and optionally filter by schema."""
+            result = []
+            for p in parse_devstral_tool_calls(full_text):
+                if tools:
+                    p = filter_tool_call_by_schema(p, tools)
+                result.append(json.dumps(p))
+            return result
+
+        # Extract Devstral-style [TOOL_CALLS]name[ARGS]json blocks
+        if text and "[TOOL_CALLS]" in text:
+            extracted.extend(extract_and_filter_devstral(text))
+            if extracted:
+                # Remove the tool call markers and content from the text
+                devstral_pattern = re.compile(
+                    r'\[TOOL_CALLS\]\w+\[ARGS\]\{.*?\}(?=\[TOOL_CALLS\]|</s>|$)',
+                    re.DOTALL
+                )
+                clean_text = devstral_pattern.sub('', text)
+
         # Extract <minimax:tool_call> blocks
-        if text and "<minimax:tool_call>" in text:
+        elif text and "<minimax:tool_call>" in text:
             pattern = re.compile(
                 r'<minimax:tool_call>(.*?)(?:</minimax:tool_call>|\[e~\[|$)', re.DOTALL
             )
@@ -1523,6 +1681,8 @@ class APIHandler(BaseHTTPRequestHandler):
             clean_text = self._clean_thinking_content(clean_text)
             # Also clean minimax tool call tags (already extracted above)
             clean_text = re.sub(r'</?minimax:tool_call>', '', clean_text)
+            # Clean any remaining Devstral markers
+            clean_text = re.sub(r'\[TOOL_CALLS\]|\[ARGS\]|\[/TOOL_RESULTS\]|\[TOOL_RESULTS\]', '', clean_text)
 
         return clean_text, extracted
 
@@ -1809,7 +1969,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         in_thinking = False
 
                 # Detect inline XML tool calls for models without special tokens
-                if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text):
+                # Also detect Devstral [TOOL_CALLS] marker
+                if not in_xml_tool_call and ("<minimax:tool_call>" in text or "<invoke " in text or "<invoke\n" in text or "[TOOL_CALLS]" in text):
                     in_xml_tool_call = True
 
             # Save the token and its logprob
@@ -2179,6 +2340,24 @@ def main():
         type=int,
         default=128000,
         help="Default maximum number of tokens to generate (default: 128000)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization (e.g., 8 for 8-bit). None means no quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Token position to begin KV cache quantization (default: 0)",
     )
     parser.add_argument(
         "--chat-template-args",
