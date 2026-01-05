@@ -115,9 +115,39 @@ def _minimax_normalize_path_separators(value: str) -> str:
     return value
 
 
+def _minimax_normalize_hyphen_spacing(value: str) -> str:
+    # MiniMax can emit tokenizer-leading spaces after "-" inside identifiers (e.g. "high- score-label").
+    # Avoid touching " - " minus operators / list bullets by only fixing cases where "-" is directly
+    # attached to the left token.
+    if not value:
+        return value
+    # "button-- primary" -> "button--primary"
+    value = re.sub(r"(?<=\w-)-\s+(?=\w)", "-", value)
+    # "high- score" -> "high-score"
+    value = re.sub(r"(?<=\w)-\s+(?=\w)", "-", value)
+    return value
+
+
+def _minimax_normalize_underscore_spacing(value: str) -> str:
+    # MiniMax can emit tokenizer-leading spaces after "_" inside identifiers/paths
+    # (e.g. "oauth_ server.rs"). Avoid touching " _ " by only fixing cases where
+    # "_" is directly attached to the left token.
+    if not value:
+        return value
+    value = re.sub(r"(?<=\w)_\s+(?=\w)", "_", value)
+    return value
+
+
+def _minimax_normalize_tokenizer_spacing(value: str) -> str:
+    value = _minimax_normalize_path_separators(value)
+    value = _minimax_normalize_hyphen_spacing(value)
+    value = _minimax_normalize_underscore_spacing(value)
+    return value
+
+
 def _minimax_normalize_tool_arguments(obj: Any) -> Any:
     if isinstance(obj, str):
-        return _minimax_normalize_path_separators(obj)
+        return _minimax_normalize_tokenizer_spacing(obj)
     if isinstance(obj, list):
         return [_minimax_normalize_tool_arguments(v) for v in obj]
     if isinstance(obj, dict):
@@ -140,7 +170,7 @@ def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
                 parsed = json.loads(param_value)
                 arguments[param_name] = _minimax_normalize_tool_arguments(parsed)
             except (json.JSONDecodeError, ValueError):
-                arguments[param_name] = _minimax_normalize_path_separators(param_value)
+                arguments[param_name] = _minimax_normalize_tokenizer_spacing(param_value)
         tool_calls.append({"name": tool_name, "arguments": arguments})
 
     return tool_calls
@@ -184,7 +214,8 @@ def normalize_tool_calls(tool_calls: List[Any]) -> List[dict]:
     for entry in tool_calls or []:
         if isinstance(entry, dict):
             if "name" in entry and "arguments" in entry:
-                normalized.append(entry)
+                args = entry.get("arguments")
+                normalized.append({**entry, "arguments": _minimax_normalize_tool_arguments(args)})
             continue
         if entry is None:
             continue
@@ -207,10 +238,14 @@ def normalize_tool_calls(tool_calls: List[Any]) -> List[dict]:
             continue
 
         if isinstance(parsed, dict):
+            if "arguments" in parsed:
+                parsed["arguments"] = _minimax_normalize_tool_arguments(parsed.get("arguments"))
             normalized.append(parsed)
         elif isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
+                    if "arguments" in item:
+                        item = {**item, "arguments": _minimax_normalize_tool_arguments(item.get("arguments"))}
                     normalized.append(item)
 
     return normalized
@@ -1841,6 +1876,8 @@ def generation_loop(dist_state, model, tokenizer, args, prompt_cache_store=None)
     if prompt_cache_store is None:
         prompt_cache_store = LRUPromptCache(max_size=max(0, int(args.prompt_cache_size)))
 
+    request_n = 0
+
     while True:
         # All ranks sync and check for requests
         (
@@ -1863,6 +1900,21 @@ def generation_loop(dist_state, model, tokenizer, args, prompt_cache_store=None)
             continue
 
         mx.random.seed(int(seed))
+        request_n += 1
+
+        if rank == 0:
+            logging.info(
+                "Request params: req=%d seed=%d max_tokens=%d temperature=%.3f top_p=%.3f top_k=%d repetition_penalty=%.3f repetition_context_size=%d stop_sequences=%d",
+                request_n,
+                int(seed),
+                int(max_tokens) if max_tokens is not None else 0,
+                float(temperature),
+                float(top_p),
+                int(top_k),
+                float(repetition_penalty),
+                int(repetition_context_size),
+                len(stop_token_sequences or []),
+            )
 
         sampler = make_sampler(
             temp=temperature,

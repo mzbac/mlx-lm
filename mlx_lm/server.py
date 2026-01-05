@@ -299,9 +299,39 @@ def _minimax_normalize_path_separators(value: str) -> str:
     return value
 
 
+def _minimax_normalize_hyphen_spacing(value: str) -> str:
+    # MiniMax can emit tokenizer-leading spaces after "-" inside identifiers (e.g. "high- score-label").
+    # Avoid touching " - " minus operators / list bullets by only fixing cases where "-" is directly
+    # attached to the left token.
+    if not value:
+        return value
+    # "button-- primary" -> "button--primary"
+    value = re.sub(r"(?<=\w-)-\s+(?=\w)", "-", value)
+    # "high- score" -> "high-score"
+    value = re.sub(r"(?<=\w)-\s+(?=\w)", "-", value)
+    return value
+
+
+def _minimax_normalize_underscore_spacing(value: str) -> str:
+    # MiniMax can emit tokenizer-leading spaces after "_" inside identifiers/paths
+    # (e.g. "oauth_ server.rs"). Avoid touching " _ " by only fixing cases where
+    # "_" is directly attached to the left token.
+    if not value:
+        return value
+    value = re.sub(r"(?<=\w)_\s+(?=\w)", "_", value)
+    return value
+
+
+def _minimax_normalize_tokenizer_spacing(value: str) -> str:
+    value = _minimax_normalize_path_separators(value)
+    value = _minimax_normalize_hyphen_spacing(value)
+    value = _minimax_normalize_underscore_spacing(value)
+    return value
+
+
 def _minimax_normalize_tool_arguments(obj: Any) -> Any:
     if isinstance(obj, str):
-        return _minimax_normalize_path_separators(obj)
+        return _minimax_normalize_tokenizer_spacing(obj)
     if isinstance(obj, list):
         return [_minimax_normalize_tool_arguments(v) for v in obj]
     if isinstance(obj, dict):
@@ -332,7 +362,7 @@ def parse_minimax_tool_calls(tool_text: str) -> List[dict]:
                 parsed = json.loads(param_value)
                 arguments[param_name] = _minimax_normalize_tool_arguments(parsed)
             except (json.JSONDecodeError, ValueError):
-                arguments[param_name] = _minimax_normalize_path_separators(param_value)
+                arguments[param_name] = _minimax_normalize_tokenizer_spacing(param_value)
         tool_calls.append({"name": tool_name, "arguments": arguments})
 
     return tool_calls
@@ -389,15 +419,37 @@ def parse_devstral_tool_calls(text: str) -> List[dict]:
 
 
 def normalize_tool_calls(tool_texts: List[str]) -> List[str]:
-    """Normalize tool call text from various formats to standard JSON."""
-    normalized = []
+    """Normalize tool call text from various formats to standard JSON.
+
+    MiniMax tool calls can arrive as <invoke> XML blocks or as JSON objects.
+    When JSON is already present, normalize tokenizer-induced spacing inside
+    arguments (e.g. "/ Users / foo .py", "high- score-label").
+    """
+    normalized: List[str] = []
     for tool_text in tool_texts:
         text = tool_text.strip()
         if "<invoke" in text and "</invoke>" in text:
             for call in parse_minimax_tool_calls(text):
                 normalized.append(json.dumps(call))
+            continue
+
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            normalized.append(text)
+            continue
+
+        if isinstance(parsed, dict) and "arguments" in parsed:
+            args = parsed.get("arguments")
+            normalized_args = _minimax_normalize_tool_arguments(args)
+            if normalized_args != args:
+                parsed["arguments"] = normalized_args
+                normalized.append(json.dumps(parsed))
+            else:
+                normalized.append(text)
         else:
             normalized.append(text)
+
     return normalized
 
 
